@@ -40,7 +40,7 @@ struct Schema {
 #[derive(Deserialize)]
 struct Question {
     id: String,
-    kind: String, // single | multi | text
+    kind: String, // single | multi | text | avail
     #[serde(default)]
     options: Vec<String>,
     #[serde(default)]
@@ -86,6 +86,8 @@ fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
         let ok = match q.kind.as_str() {
             "single" => in_range(v),
             "multi" => v.as_array().is_some_and(|l| l.iter().all(in_range)),
+            // one value per slot: 0 = no, 1 = yes, 2 = maybe
+            "avail" => v.as_array().is_some_and(|l| l.len() == q.options.len() && l.iter().all(|x| x.as_u64().is_some_and(|n| n <= 2))),
             "text" => v.as_str().is_some_and(|s| s.len() <= 2000),
             _ => false,
         };
@@ -239,6 +241,18 @@ mod tests {
     fn resp(owner: &str, who: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
         let msg = format!("fpr1|{owner}|{}|{ts}|{ans}", pk(who));
         (pk(who), Response { ts, answers_json: ans.into(), sig: hex::encode(who.sign(msg.as_bytes()).to_bytes()) })
+    }
+
+    #[test]
+    fn availability_answers() {
+        let schema = Schema {
+            questions: vec![Question { id: "d".into(), kind: "avail".into(), options: vec!["mon".into(), "tue".into(), "wed".into()], required: true }],
+        };
+        assert!(check_answers(&schema, r#"{"d":[1,0,2]}"#).is_ok());
+        assert!(check_answers(&schema, r#"{"d":[1,0]}"#).is_err()); // wrong length
+        assert!(check_answers(&schema, r#"{"d":[1,0,3]}"#).is_err()); // out of range
+        assert!(check_answers(&schema, r#"{"d":"yes"}"#).is_err());
+        assert!(check_answers(&schema, "{}").is_err()); // required
     }
 
     #[test]

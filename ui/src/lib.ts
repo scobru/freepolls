@@ -10,7 +10,7 @@ import { RelatedContractsT } from "@freenetorg/freenet-stdlib/client-request";
 import wasmUrl from "./contract.wasm?url";
 
 // ---- types mirroring contract/src/lib.rs ----
-export type Kind = "single" | "multi" | "text";
+export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
 export interface Schema { title: string; questions: Question[] }
 export interface Response { ts: number; answers_json: string; sig: string }

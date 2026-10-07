@@ -29,9 +29,9 @@ function builder() {
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
           <input class="qt" placeholder="Domanda" value="${esc(q.text)}" />
-          <select class="qk">${(["single", "multi", "text"] as Kind[]).map((k) =>
-            `<option value="${k}" ${k === q.kind ? "selected" : ""}>${{ single: "Scelta singola", multi: "Scelta multipla", text: "Testo" }[k]}</option>`).join("")}</select>
-          ${q.kind === "text" ? "" : `<textarea class="qo" placeholder="Una opzione per riga">${esc(q.options.join("\n"))}</textarea>`}
+          <select class="qk">${(["single", "multi", "avail", "text"] as Kind[]).map((k) =>
+            `<option value="${k}" ${k === q.kind ? "selected" : ""}>${{ single: "Scelta singola", multi: "Scelta multipla", avail: "Disponibilità (date/orari)", text: "Testo" }[k]}</option>`).join("")}</select>
+          ${q.kind === "text" ? "" : `<textarea class="qo" placeholder="${q.kind === "avail" ? "Uno slot per riga, es. Lun 12 ott 18:00" : "Una opzione per riga"}">${esc(q.options.join("\n"))}</textarea>`}
           <label><input type="checkbox" class="qr" ${q.required ? "checked" : ""}/> obbligatoria</label>
           <button class="up" type="button" ${i === 0 ? "disabled" : ""}>↑</button>
           <button class="down" type="button" ${i === qs.length - 1 ? "disabled" : ""}>↓</button>
@@ -60,9 +60,9 @@ function builder() {
         questions: qs.map((q) => ({ ...q, options: q.kind === "text" ? [] : q.options.map((o) => o.trim()).filter(Boolean) })),
       };
       const bad = !schema.title || !schema.questions.length ||
-        schema.questions.some((q) => !q.text.trim() || (q.kind !== "text" && q.options.length < 2));
+        schema.questions.some((q) => !q.text.trim() || (q.kind !== "text" && q.options.length < (q.kind === "avail" ? 1 : 2)));
       const msg = $("#msg");
-      if (bad) return void (msg.textContent = "Titolo, testo domande e almeno 2 opzioni per le scelte.");
+      if (bad) return void (msg.textContent = "Titolo, testo domande e almeno 2 opzioni per le scelte (1 slot per la disponibilità).");
       msg.textContent = "Pubblicazione...";
       try {
         const { instance, owner } = await publish(schema);
@@ -92,7 +92,7 @@ async function form(instance: string, owner: string) {
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
     const n = Object.keys(st.responses).length;
     app.innerHTML = `
-      <p><a href="#/">← Nuovo form</a></p>
+      <p><a href="#/">← Nuovo sondaggio</a></p>
       <h1>${esc(schema.title)}</h1>
       <p class="muted">${me.pk === owner ? "Sei il proprietario. " : ""}Link da condividere: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>
       ${me.persisted ? "" : `<p class="muted">⚠ Identità temporanea: finché chiudi la pagina puoi aggiornare la tua risposta, dopo conterà come un nuovo rispondente.</p>`}
@@ -101,6 +101,12 @@ async function form(instance: string, owner: string) {
           <fieldset><legend>${esc(q.text)}${q.required ? " *" : ""}</legend>
           ${q.kind === "text"
             ? `<textarea name="${q.id}" maxlength="2000">${esc(String(prev[q.id] ?? ""))}</textarea>`
+            : q.kind === "avail"
+            ? q.options.map((o, i) => {
+                const cur = ((prev[q.id] as number[]) ?? [])[i] ?? 0;
+                return `<label class="slot"><span>${esc(o)}</span><select name="${q.id}">${([[1, "Sì"], [2, "Forse"], [0, "No"]] as const).map(([v, t]) =>
+                  `<option value="${v}" ${cur === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>`;
+              }).join("")
             : q.options.map((o, i) => {
                 const on = q.kind === "multi" ? ((prev[q.id] as number[]) ?? []).includes(i) : prev[q.id] === i;
                 return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${q.id}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
@@ -116,7 +122,7 @@ async function form(instance: string, owner: string) {
       for (const q of schema.questions) {
         const v = fd.getAll(q.id).map(String);
         if (q.kind === "text") { if (v[0]) a[q.id] = v[0]; }
-        else if (q.kind === "multi") { if (v.length) a[q.id] = v.map(Number); }
+        else if (q.kind === "multi" || q.kind === "avail") { if (v.length) a[q.id] = v.map(Number); }
         else if (v.length) a[q.id] = +v[0];
         if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Manca: ${q.text}`);
       }
@@ -129,6 +135,18 @@ async function form(instance: string, owner: string) {
   const results = () => schema.questions.map((q) => {
     const all = Object.values(st.responses).map((r) => (JSON.parse(r.answers_json) as Answers)[q.id]).filter((v) => v !== undefined);
     if (q.kind === "text") return `<h3>${esc(q.text)}</h3><ul>${all.map((t) => `<li>${esc(String(t))}</li>`).join("")}</ul>`;
+    if (q.kind === "avail") {
+      const yes = q.options.map(() => 0), maybe = q.options.map(() => 0);
+      all.forEach((v) => (v as number[]).forEach((x, i) => { if (x === 1) yes[i]++; else if (x === 2) maybe[i]++; }));
+      // best slot = most "yes", ties broken by "maybe"; none highlighted until someone says yes or maybe
+      const score = (i: number) => yes[i] * 1000 + maybe[i];
+      const best = Math.max(...q.options.map((_, i) => score(i)));
+      const max = Math.max(1, ...yes.map((y, i) => y + maybe[i]));
+      return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
+        `<div class="bar${best > 0 && score(i) === best ? " best" : ""}"><span>${best > 0 && score(i) === best ? "★ " : ""}${esc(o)}</span>` +
+        `<i style="width:${(yes[i] / max) * 100}%"></i><u style="left:${(yes[i] / max) * 100}%;width:${(maybe[i] / max) * 100}%"></u>` +
+        `<b>${yes[i]} sì${maybe[i] ? ` · ${maybe[i]} forse` : ""}</b></div>`).join("");
+    }
     const counts = q.options.map(() => 0);
     all.forEach((v) => ([] as number[]).concat(v as number | number[]).forEach((i) => counts[i]++));
     const max = Math.max(1, ...counts);

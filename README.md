@@ -4,7 +4,7 @@ Polls and forms on [Freenet](https://freenet.org). No server, no account: every 
 
 - **Contract**: Rust compiled to WASM (`contract/`).
 - **UI**: TypeScript + Vite, no framework (`ui/`). Talks to the node through [`@freenetorg/freenet-stdlib`](https://freenet.org/build/manual/typescript-sdk).
-- **Question types**: single choice, multiple choice, free text. Required flag, reordering, live results.
+- **Question types**: single choice, multiple choice, free text, and **availability** (Doodle-style: one yes / maybe / no per date slot, with the best slot highlighted). Required flag, reordering, live results.
 
 ## How it works
 
@@ -29,6 +29,8 @@ The UI computes the same id before publishing (same derivation as `freenet-stdli
 }
 ```
 
+Answer values by question kind: `single` = option index, `multi` = list of option indexes, `text` = string, `avail` = one value per option (slot) in order, `0` = no, `1` = yes, `2` = maybe. The best availability slot is the one with most "yes", ties broken by "maybe".
+
 `schema_json` and `answers_json` are kept as the exact strings that were signed, so no JSON canonicalization is needed on either side.
 
 ### Signed messages
@@ -42,7 +44,7 @@ Including the owner key in the answer message stops a response from being replay
 
 ### Contract rules (`contract/src/lib.rs`)
 
-- `validate_state`: schema signature valid; every response signature valid; every answer matches the schema (known question ids, option indexes in range, required questions answered, text up to 2000 bytes).
+- `validate_state`: schema signature valid; every response signature valid; every answer matches the schema (known question ids, option indexes in range, `avail` length equal to the number of slots, required questions answered, text up to 2000 bytes).
 - `update_state`: the schema is set once. Responses merge **per respondent, last write wins by `ts`**. Older or equal `ts` is ignored. Anything invalid rejects the update.
 - `summarize_state` / `get_state_delta`: summary = `{ has_schema, responses: pubkey -> ts }`; delta = the schema if the peer lacks it, plus responses newer than the peer's summary. An empty summary or empty state means "nothing known yet" (the node sends one on subscribe).
 
@@ -113,6 +115,7 @@ fdev website update dist --key freepolls
 - Encrypted answers readable only by the owner.
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.
+- Sybil-resistant voting (one vote per persona) using whoiam / ante identities.
 
 ## License
 
