@@ -1,0 +1,16 @@
+:root { color-scheme: light dark; --bg: #f6f5f9; --fg: #1d1b24; --card: #fff; --accent: #6d4aff; --line: #d9d6e4; }
+@media (prefers-color-scheme: dark) { :root { --bg: #16151b; --fg: #ecebf3; --card: #211f2a; --line: #3a3750; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 small { display: block; font-size: .5em; font-weight: 400; opacity: .6; }
+input, select, textarea, button { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; box-sizing: border-box; }
+input:not([type=radio]):not([type=checkbox]), textarea, select { width: 100%; margin: 4px 0; }
+.card, fieldset { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin: 12px 0; }
+fieldset label { display: block; padding: 4px 0; }
+fieldset input[type=radio], fieldset input[type=checkbox] { margin-right: 8px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.muted { opacity: .7; } .err { color: #d33; }
+.bar { position: relative; display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; margin: 4px 0; border-radius: 6px; overflow: hidden; }
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: .25; z-index: -1; }
+.bar { z-index: 0; isolation: isolate; }
