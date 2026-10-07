@@ -113,3 +113,7 @@ fdev website update dist --key freepolls
 - Encrypted answers readable only by the owner.
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
