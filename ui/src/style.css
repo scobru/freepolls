@@ -18,3 +18,6 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .slot select { width: auto; }
 .bar u { position: absolute; top: 0; bottom: 0; background: var(--accent); opacity: .12; z-index: -1; }
 .bar.best { outline: 2px solid var(--accent); font-weight: 600; }
+footer { max-width: 640px; margin: 0 auto; padding: 0 16px 32px; font-size: .85em; opacity: .7; }
+footer a, main a { color: var(--accent); }
+details { margin: 8px 0; } details textarea { width: 100%; }

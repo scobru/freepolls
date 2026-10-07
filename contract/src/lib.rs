@@ -35,7 +35,12 @@ pub struct Delta {
 #[derive(Deserialize)]
 struct Schema {
     questions: Vec<Question>,
+    /// Invite-only poll: pubkeys (hex) allowed to answer. `None` = open poll.
+    #[serde(default)]
+    allowed: Option<Vec<String>>,
 }
+
+const MAX_INVITES: usize = 1000;
 
 #[derive(Deserialize)]
 struct Question {
@@ -65,7 +70,14 @@ fn verify(k: &VerifyingKey, msg: &[u8], sig_hex: &str) -> R<()> {
 
 fn parse_schema(owner: &str, schema_json: &str, sig: &str) -> R<Schema> {
     verify(&key(owner)?, format!("fps1|{schema_json}").as_bytes(), sig)?;
-    serde_json::from_str(schema_json).map_err(|e| e.to_string())
+    let schema: Schema = serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
+    if let Some(a) = &schema.allowed {
+        if a.len() > MAX_INVITES {
+            return Err("too many invites".into());
+        }
+        a.iter().try_for_each(|k| key(k).map(|_| ()))?;
+    }
+    Ok(schema)
 }
 
 fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
@@ -99,6 +111,9 @@ fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
 }
 
 fn check_response(owner: &str, schema: &Schema, who: &str, r: &Response) -> R<()> {
+    if schema.allowed.as_ref().is_some_and(|a| !a.iter().any(|k| k == who)) {
+        return Err("respondent not invited".into());
+    }
     let msg = format!("fpr1|{owner}|{who}|{}|{}", r.ts, r.answers_json);
     verify(&key(who)?, msg.as_bytes(), &r.sig)?;
     check_answers(schema, &r.answers_json)
@@ -247,12 +262,36 @@ mod tests {
     fn availability_answers() {
         let schema = Schema {
             questions: vec![Question { id: "d".into(), kind: "avail".into(), options: vec!["mon".into(), "tue".into(), "wed".into()], required: true }],
+            allowed: None,
         };
         assert!(check_answers(&schema, r#"{"d":[1,0,2]}"#).is_ok());
         assert!(check_answers(&schema, r#"{"d":[1,0]}"#).is_err()); // wrong length
         assert!(check_answers(&schema, r#"{"d":[1,0,3]}"#).is_err()); // out of range
         assert!(check_answers(&schema, r#"{"d":"yes"}"#).is_err());
         assert!(check_answers(&schema, "{}").is_err()); // required
+    }
+
+    #[test]
+    fn invite_only() {
+        let o = sk(1);
+        let op = pk(&o);
+        let (invited, stranger) = (sk(2), sk(3));
+        let schema = format!(
+            r#"{{"questions":[{{"id":"q1","kind":"single","options":["a","b"],"required":true}}],"allowed":["{}"]}}"#,
+            pk(&invited)
+        );
+        let sig = hex::encode(o.sign(format!("fps1|{schema}").as_bytes()).to_bytes());
+        let mut s = FormState::default();
+        let (k, r) = resp(&op, &invited, 1, r#"{"q1":0}"#);
+        apply(&op, &mut s, Delta { schema: Some((schema, sig)), responses: [(k, r)].into() }).unwrap();
+        validate(&op, &s).unwrap();
+        let (k2, r2) = resp(&op, &stranger, 1, r#"{"q1":0}"#);
+        assert!(apply(&op, &mut s, Delta { responses: [(k2, r2)].into(), ..Default::default() }).is_err());
+
+        // malformed invite key rejected at schema level
+        let bad = r#"{"questions":[],"allowed":["zz"]}"#;
+        let bad_sig = hex::encode(o.sign(format!("fps1|{bad}").as_bytes()).to_bytes());
+        assert!(parse_schema(&op, bad, &bad_sig).is_err());
     }
 
     #[test]

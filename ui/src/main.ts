@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  identity, loadState, onRemoteChange, publish, sendResponse, signAnswers, watch,
+  identity, identityFrom, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, watch,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -8,11 +8,16 @@ const app = document.getElementById("app")!;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.querySelector(sel) as T;
 
-// route: #/ (builder)  |  #/f/<instanceB58>.<ownerHex> (form)
+// route: #/ (builder)  |  #/f/<instanceB58>.<ownerHex>[/i/<inviteSecretHex>] (poll)
 function route() {
-  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{64})$/);
-  return m ? form(m[1], m[2]) : builder();
+  // inside the Freenet container, keep the address bar in sync so the URL is shareable
+  if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
+  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{64})(?:\/i\/([0-9a-f]{64}))?$/);
+  return m ? form(m[1], m[2], m[3]) : builder();
 }
+// page URL without the container's ?__sandbox=1 query
+const pageUrl = (hash: string) => `${location.protocol}//${location.host}${location.pathname}${hash}`;
+
 // ---------------- my forms (per-browser list; ponytail: localStorage, lost if site data is cleared) ----------------
 type Saved = { title: string; hash: string };
 const myForms = (): Saved[] => { try { return JSON.parse(localStorage.getItem("fp-polls") ?? "[]"); } catch { return []; } };
@@ -21,7 +26,7 @@ const saveForm = (f: Saved) => { try { localStorage.setItem("fp-polls", JSON.str
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "";
+  let title = "", inviteOnly = false, nInvites = 10;
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>sondaggi e form su Freenet</small></h1>
@@ -37,10 +42,15 @@ function builder() {
           <button class="down" type="button" ${i === qs.length - 1 ? "disabled" : ""}>↓</button>
           <button class="del" type="button">Rimuovi</button>
         </section>`).join("")}
+      <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Solo su invito: un link personale = un voto</label>
+      ${inviteOnly ? `<label>Numero di inviti <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
       <p><button id="add" type="button">+ Domanda</button> <button id="pub" type="button" class="primary">Pubblica</button></p>
       <p id="msg"></p>
       ${myForms().length ? `<h2>I miei sondaggi</h2><ul>${myForms().map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : ""}`;
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
+    $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; draw(); };
+    const ni = app.querySelector<HTMLInputElement>("#ni");
+    if (ni) ni.oninput = () => (nInvites = Math.min(200, Math.max(1, +ni.value || 1)));
     app.querySelectorAll<HTMLElement>("section.card").forEach((s) => {
       const i = +s.dataset.i!, q = qs[i];
       $<HTMLInputElement>(".qt", s).oninput = (e) => (q.text = (e.target as HTMLInputElement).value);
@@ -65,20 +75,42 @@ function builder() {
       if (bad) return void (msg.textContent = "Titolo, testo domande e almeno 2 opzioni per le scelte (1 slot per la disponibilità).");
       msg.textContent = "Pubblicazione...";
       try {
+        const invites = inviteOnly ? await newInvites(nInvites) : [];
+        if (invites.length) schema.allowed = invites.map((i) => i.pk);
         const { instance, owner } = await publish(schema);
         const hash = `#/f/${instance}.${owner}`;
         saveForm({ title: schema.title, hash });
-        location.hash = hash;
+        if (!invites.length) return void (location.hash = hash);
+        const secrets = invites.map((i) => i.secret);
+        try { localStorage.setItem(`fp-inv:${instance}`, JSON.stringify(secrets)); } catch { /* storage blocked */ }
+        showInvites(hash, secrets);
       } catch (e) { msg.textContent = `Errore: ${e}`; }
     };
   };
   draw();
 }
 
+// ---------------- invite links (secrets exist only in the browser that created the poll) ----------------
+const inviteLinks = (hash: string, secrets: string[]) => secrets.map((s) => pageUrl(`${hash}/i/${s}`));
+
+function showInvites(hash: string, secrets: string[]) {
+  const links = inviteLinks(hash, secrets);
+  app.innerHTML = `
+    <h1>Sondaggio pubblicato</h1>
+    <p>${links.length} inviti, un link per persona. <b>Salvali adesso</b>: i link personali non si possono ricostruire e non vengono più mostrati se il browser non li ricorda.</p>
+    <textarea id="links" readonly rows="${Math.min(links.length, 12) + 1}">${esc(links.join("\n"))}</textarea>
+    <p><button id="copy" class="primary" type="button">Copia tutti</button> <a href="${esc(hash)}">Apri il sondaggio</a></p>`;
+  $("#copy").onclick = async () => {
+    const t = $<HTMLTextAreaElement>("#links");
+    t.select();
+    try { await navigator.clipboard.writeText(t.value); } catch { document.execCommand("copy"); }
+  };
+}
+
 // ---------------- form: fill + live results ----------------
-async function form(instance: string, owner: string) {
+async function form(instance: string, owner: string, invite?: string) {
   app.innerHTML = "<p>Caricamento...</p>";
-  const me = await identity();
+  const me = invite ? await identityFrom(invite) : await identity();
   let st: FormState, schema: Schema;
   try {
     st = await loadState(instance);
@@ -86,17 +118,25 @@ async function form(instance: string, owner: string) {
     void watch(instance).catch(console.warn); // subscribe() may not resolve in local mode; don't block on it
   } catch (e) { return void (app.innerHTML = `<p class="err">Impossibile caricare il form: ${esc(String(e))}</p>`); }
 
-  const link = location.href;
+  const link = pageUrl(`#/f/${instance}.${owner}`);
+  const invited = !schema.allowed || schema.allowed.includes(me.pk);
+  let savedInvites: string[] = [];
+  try { savedInvites = JSON.parse(localStorage.getItem(`fp-inv:${instance}`) ?? "[]"); } catch { /* storage blocked */ }
   const draw = () => {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
     const n = Object.keys(st.responses).length;
+    const own = me.pk === owner;
+    const intro = !schema.allowed
+      ? `<p class="muted">${own ? "Sei il proprietario. " : ""}Link da condividere: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>`
+      : `<p class="muted">${own ? `Sei il proprietario. Sondaggio su invito: ${schema.allowed.length} inviti.` : invited ? "Hai un invito personale: conserva questo link per modificare la tua risposta." : "Sondaggio su invito: per rispondere serve il tuo link personale."}</p>` +
+        (own && savedInvites.length ? `<details><summary>Link d'invito (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${owner}`, savedInvites).join("\n"))}</textarea></details>` : "");
     app.innerHTML = `
       <p><a href="#/">← Nuovo sondaggio</a></p>
       <h1>${esc(schema.title)}</h1>
-      <p class="muted">${me.pk === owner ? "Sei il proprietario. " : ""}Link da condividere: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>
-      ${me.persisted ? "" : `<p class="muted">⚠ Identità temporanea: finché chiudi la pagina puoi aggiornare la tua risposta, dopo conterà come un nuovo rispondente.</p>`}
-      <form id="f">
+      ${intro}
+      ${me.persisted || !invited ? "" : `<p class="muted">⚠ Identità temporanea: finché chiudi la pagina puoi aggiornare la tua risposta, dopo conterà come un nuovo rispondente.</p>`}
+      <form id="f" ${invited ? "" : "hidden"}>
         ${schema.questions.map((q) => `
           <fieldset><legend>${esc(q.text)}${q.required ? " *" : ""}</legend>
           ${q.kind === "text"
@@ -128,7 +168,7 @@ async function form(instance: string, owner: string) {
       }
       $("#msg").textContent = "Invio...";
       try { await sendResponse(instance, me.pk, await signAnswers(me.sk, owner, me.pk, a)); await refresh(); }
-      catch (err) { $("#msg").textContent = `Errore: ${err}`; }
+      catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "Il nodo non ha accettato la risposta (poll su invito: serve il tuo link personale)." : `Errore: ${err}`; }
     };
   };
 

@@ -12,7 +12,7 @@ import wasmUrl from "./contract.wasm?url";
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
-export interface Schema { title: string; questions: Question[] }
+export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
 export interface Response { ts: number; answers_json: string; sig: string }
 export interface FormState { schema_json: string; schema_sig: string; responses: Record<string, Response> }
 export type Answers = Record<string, number | number[] | string>;
@@ -35,6 +35,20 @@ export async function identity() {
   memKey = h;
   const sk = unhex(h);
   return { sk, pk: hex(await ed.getPublicKeyAsync(sk)), persisted };
+}
+
+/** Identity from an invite secret carried in the link (works without storage, e.g. in the sandboxed container). */
+export async function identityFrom(secretHex: string) {
+  const sk = unhex(secretHex);
+  return { sk, pk: hex(await ed.getPublicKeyAsync(sk)), persisted: true };
+}
+
+/** Fresh invite keypairs: the secret goes into the personal link, the pubkey into the signed schema. */
+export async function newInvites(n: number) {
+  return Promise.all(Array.from({ length: n }, async () => {
+    const sk = ed.utils.randomPrivateKey();
+    return { secret: hex(sk), pk: hex(await ed.getPublicKeyAsync(sk)) };
+  }));
 }
 
 // ---- signing: message formats must match the contract ----
