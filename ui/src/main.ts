@@ -29,24 +29,24 @@ function builder() {
   let title = "", inviteOnly = false, nInvites = 10;
   const draw = () => {
     app.innerHTML = `
-      <h1>FreePolls <small>sondaggi e form su Freenet</small></h1>
-      <input id="title" placeholder="Titolo" value="${esc(title)}" />
+      <h1>FreePolls <small>polls and forms on Freenet</small></h1>
+      <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
-          <input class="qt" placeholder="Domanda" value="${esc(q.text)}" />
+          <input class="qt" placeholder="Question" value="${esc(q.text)}" />
           <select class="qk">${(["single", "multi", "avail", "text"] as Kind[]).map((k) =>
-            `<option value="${k}" ${k === q.kind ? "selected" : ""}>${{ single: "Scelta singola", multi: "Scelta multipla", avail: "Disponibilità (date/orari)", text: "Testo" }[k]}</option>`).join("")}</select>
-          ${q.kind === "text" ? "" : `<textarea class="qo" placeholder="${q.kind === "avail" ? "Uno slot per riga, es. Lun 12 ott 18:00" : "Una opzione per riga"}">${esc(q.options.join("\n"))}</textarea>`}
-          <label><input type="checkbox" class="qr" ${q.required ? "checked" : ""}/> obbligatoria</label>
+            `<option value="${k}" ${k === q.kind ? "selected" : ""}>${{ single: "Single choice", multi: "Multiple choice", avail: "Availability (dates/times)", text: "Text" }[k]}</option>`).join("")}</select>
+          ${q.kind === "text" ? "" : `<textarea class="qo" placeholder="${q.kind === "avail" ? "One slot per line, e.g. Mon Oct 12 6pm" : "One option per line"}">${esc(q.options.join("\n"))}</textarea>`}
+          <label><input type="checkbox" class="qr" ${q.required ? "checked" : ""}/> required</label>
           <button class="up" type="button" ${i === 0 ? "disabled" : ""}>↑</button>
           <button class="down" type="button" ${i === qs.length - 1 ? "disabled" : ""}>↓</button>
-          <button class="del" type="button">Rimuovi</button>
+          <button class="del" type="button">Remove</button>
         </section>`).join("")}
-      <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Solo su invito: un link personale = un voto</label>
-      ${inviteOnly ? `<label>Numero di inviti <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
-      <p><button id="add" type="button">+ Domanda</button> <button id="pub" type="button" class="primary">Pubblica</button></p>
+      <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Invite only: one personal link = one vote</label>
+      ${inviteOnly ? `<label>Number of invites <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
+      <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
-      ${myForms().length ? `<h2>I miei sondaggi</h2><ul>${myForms().map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : ""}`;
+      ${myForms().length ? `<h2>My polls</h2><ul>${myForms().map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : ""}`;
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
     $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; draw(); };
     const ni = app.querySelector<HTMLInputElement>("#ni");
@@ -72,8 +72,8 @@ function builder() {
       const bad = !schema.title || !schema.questions.length ||
         schema.questions.some((q) => !q.text.trim() || (q.kind !== "text" && q.options.length < (q.kind === "avail" ? 1 : 2)));
       const msg = $("#msg");
-      if (bad) return void (msg.textContent = "Titolo, testo domande e almeno 2 opzioni per le scelte (1 slot per la disponibilità).");
-      msg.textContent = "Pubblicazione...";
+      if (bad) return void (msg.textContent = "A title, question text and at least 2 options per choice question (1 slot for availability).");
+      msg.textContent = "Publishing...";
       try {
         const invites = inviteOnly ? await newInvites(nInvites) : [];
         if (invites.length) schema.allowed = invites.map((i) => i.pk);
@@ -84,7 +84,7 @@ function builder() {
         const secrets = invites.map((i) => i.secret);
         try { localStorage.setItem(`fp-inv:${instance}`, JSON.stringify(secrets)); } catch { /* storage blocked */ }
         showInvites(hash, secrets);
-      } catch (e) { msg.textContent = `Errore: ${e}`; }
+      } catch (e) { msg.textContent = `Error: ${e}`; }
     };
   };
   draw();
@@ -96,10 +96,10 @@ const inviteLinks = (hash: string, secrets: string[]) => secrets.map((s) => page
 function showInvites(hash: string, secrets: string[]) {
   const links = inviteLinks(hash, secrets);
   app.innerHTML = `
-    <h1>Sondaggio pubblicato</h1>
-    <p>${links.length} inviti, un link per persona. <b>Salvali adesso</b>: i link personali non si possono ricostruire e non vengono più mostrati se il browser non li ricorda.</p>
+    <h1>Poll published</h1>
+    <p>${links.length} invites, one link per person. <b>Save them now</b>: personal links cannot be rebuilt and will not be shown again unless this browser remembers them.</p>
     <textarea id="links" readonly rows="${Math.min(links.length, 12) + 1}">${esc(links.join("\n"))}</textarea>
-    <p><button id="copy" class="primary" type="button">Copia tutti</button> <a href="${esc(hash)}">Apri il sondaggio</a></p>`;
+    <p><button id="copy" class="primary" type="button">Copy all</button> <a href="${esc(hash)}">Open the poll</a></p>`;
   $("#copy").onclick = async () => {
     const t = $<HTMLTextAreaElement>("#links");
     t.select();
@@ -109,14 +109,14 @@ function showInvites(hash: string, secrets: string[]) {
 
 // ---------------- form: fill + live results ----------------
 async function form(instance: string, owner: string, invite?: string) {
-  app.innerHTML = "<p>Caricamento...</p>";
+  app.innerHTML = "<p>Loading...</p>";
   const me = invite ? await identityFrom(invite) : await identity();
   let st: FormState, schema: Schema;
   try {
     st = await loadState(instance);
     schema = JSON.parse(st.schema_json);
     void watch(instance).catch(console.warn); // subscribe() may not resolve in local mode; don't block on it
-  } catch (e) { return void (app.innerHTML = `<p class="err">Impossibile caricare il form: ${esc(String(e))}</p>`); }
+  } catch (e) { return void (app.innerHTML = `<p class="err">Could not load the poll: ${esc(String(e))}</p>`); }
 
   const link = pageUrl(`#/f/${instance}.${owner}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
@@ -128,14 +128,14 @@ async function form(instance: string, owner: string, invite?: string) {
     const n = Object.keys(st.responses).length;
     const own = me.pk === owner;
     const intro = !schema.allowed
-      ? `<p class="muted">${own ? "Sei il proprietario. " : ""}Link da condividere: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>`
-      : `<p class="muted">${own ? `Sei il proprietario. Sondaggio su invito: ${schema.allowed.length} inviti.` : invited ? "Hai un invito personale: conserva questo link per modificare la tua risposta." : "Sondaggio su invito: per rispondere serve il tuo link personale."}</p>` +
-        (own && savedInvites.length ? `<details><summary>Link d'invito (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${owner}`, savedInvites).join("\n"))}</textarea></details>` : "");
+      ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>`
+      : `<p class="muted">${own ? `You are the owner. Invite-only poll: ${schema.allowed.length} invites.` : invited ? "You have a personal invite: keep this link to change your answer later." : "Invite-only poll: you need your personal link to answer."}</p>` +
+        (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${owner}`, savedInvites).join("\n"))}</textarea></details>` : "");
     app.innerHTML = `
-      <p><a href="#/">← Nuovo sondaggio</a></p>
+      <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
       ${intro}
-      ${me.persisted || !invited ? "" : `<p class="muted">⚠ Identità temporanea: finché chiudi la pagina puoi aggiornare la tua risposta, dopo conterà come un nuovo rispondente.</p>`}
+      ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
       <form id="f" ${invited ? "" : "hidden"}>
         ${schema.questions.map((q) => `
           <fieldset><legend>${esc(q.text)}${q.required ? " *" : ""}</legend>
@@ -144,7 +144,7 @@ async function form(instance: string, owner: string, invite?: string) {
             : q.kind === "avail"
             ? q.options.map((o, i) => {
                 const cur = ((prev[q.id] as number[]) ?? [])[i] ?? 0;
-                return `<label class="slot"><span>${esc(o)}</span><select name="${q.id}">${([[1, "Sì"], [2, "Forse"], [0, "No"]] as const).map(([v, t]) =>
+                return `<label class="slot"><span>${esc(o)}</span><select name="${q.id}">${([[1, "Yes"], [2, "Maybe"], [0, "No"]] as const).map(([v, t]) =>
                   `<option value="${v}" ${cur === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>`;
               }).join("")
             : q.options.map((o, i) => {
@@ -152,9 +152,9 @@ async function form(instance: string, owner: string, invite?: string) {
                 return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${q.id}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
               }).join("")}
           </fieldset>`).join("")}
-        <button class="primary">${mine ? "Aggiorna risposta" : "Invia"}</button> <span id="msg"></span>
+        <button class="primary">${mine ? "Update answer" : "Submit"}</button> <span id="msg"></span>
       </form>
-      <h2>Risultati (${n} ${n === 1 ? "risposta" : "risposte"})</h2>
+      <h2>Results (${n} ${n === 1 ? "response" : "responses"})</h2>
       ${results()}`;
     $<HTMLFormElement>("#f").onsubmit = async (e) => {
       e.preventDefault();
@@ -164,11 +164,11 @@ async function form(instance: string, owner: string, invite?: string) {
         if (q.kind === "text") { if (v[0]) a[q.id] = v[0]; }
         else if (q.kind === "multi" || q.kind === "avail") { if (v.length) a[q.id] = v.map(Number); }
         else if (v.length) a[q.id] = +v[0];
-        if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Manca: ${q.text}`);
+        if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Missing: ${q.text}`);
       }
-      $("#msg").textContent = "Invio...";
+      $("#msg").textContent = "Sending...";
       try { await sendResponse(instance, me.pk, await signAnswers(me.sk, owner, me.pk, a)); await refresh(); }
-      catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "Il nodo non ha accettato la risposta (poll su invito: serve il tuo link personale)." : `Errore: ${err}`; }
+      catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "The node did not accept the answer (invite-only poll: you need your personal link)." : `Errore: ${err}`; }
     };
   };
 
@@ -185,7 +185,7 @@ async function form(instance: string, owner: string, invite?: string) {
       return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
         `<div class="bar${best > 0 && score(i) === best ? " best" : ""}"><span>${best > 0 && score(i) === best ? "★ " : ""}${esc(o)}</span>` +
         `<i style="width:${(yes[i] / max) * 100}%"></i><u style="left:${(yes[i] / max) * 100}%;width:${(maybe[i] / max) * 100}%"></u>` +
-        `<b>${yes[i]} sì${maybe[i] ? ` · ${maybe[i]} forse` : ""}</b></div>`).join("");
+        `<b>${yes[i]} yes${maybe[i] ? ` · ${maybe[i]} maybe` : ""}</b></div>`).join("");
     }
     const counts = q.options.map(() => 0);
     all.forEach((v) => ([] as number[]).concat(v as number | number[]).forEach((i) => counts[i]++));
