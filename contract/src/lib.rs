@@ -25,6 +25,8 @@ pub struct FormState {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Summary {
     pub has_schema: bool,
+    #[serde(default)]
+    pub schema_rev: u64,
     pub responses: BTreeMap<String, u64>, // pubkey -> ts
 }
 
@@ -40,6 +42,9 @@ struct Schema {
     /// Invite-only poll: pubkeys (hex) allowed to answer. `None` = open poll.
     #[serde(default)]
     allowed: Option<Vec<String>>,
+    /// Bumped by each owner-signed title change; the highest rev wins.
+    #[serde(default)]
+    rev: u64,
 }
 
 const MAX_INVITES: usize = 1000;
@@ -81,6 +86,23 @@ fn parse_schema(params: &str, schema_json: &str, sig: &str) -> R<Schema> {
         a.iter().try_for_each(|k| key(k).map(|_| ()))?;
     }
     Ok(schema)
+}
+
+fn rev_of(schema_json: &str) -> u64 {
+    serde_json::from_str::<Value>(schema_json).ok().and_then(|v| v["rev"].as_u64()).unwrap_or(0)
+}
+
+/// A schema update may only change the title (and rev): questions and invites stay fixed, so answers stay valid.
+fn same_body(a: &str, b: &str) -> bool {
+    let strip = |j: &str| {
+        let mut v: Value = serde_json::from_str(j).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("title");
+            o.remove("rev");
+        }
+        v
+    };
+    strip(a) == strip(b)
 }
 
 fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
@@ -130,8 +152,14 @@ pub fn validate(params: &str, s: &FormState) -> R<()> {
 /// Merge a delta into state: schema is set once, per-respondent last-write-wins by ts.
 pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
     if let Some((json, sig)) = d.schema {
+        let new = parse_schema(params, &json, &sig)?;
         if s.schema_json.is_empty() {
-            parse_schema(params, &json, &sig)?;
+            s.schema_json = json;
+            s.schema_sig = sig;
+        } else if new.rev > rev_of(&s.schema_json) {
+            if !same_body(&s.schema_json, &json) {
+                return Err("only the title can change".into());
+            }
             s.schema_json = json;
             s.schema_sig = sig;
         }
@@ -150,13 +178,14 @@ pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
 pub fn summarize(s: &FormState) -> Summary {
     Summary {
         has_schema: !s.schema_json.is_empty(),
+        schema_rev: rev_of(&s.schema_json),
         responses: s.responses.iter().map(|(k, r)| (k.clone(), r.ts)).collect(),
     }
 }
 
 pub fn delta(s: &FormState, sum: &Summary) -> Delta {
     Delta {
-        schema: (!sum.has_schema && !s.schema_json.is_empty())
+        schema: (!s.schema_json.is_empty() && (!sum.has_schema || rev_of(&s.schema_json) > sum.schema_rev))
             .then(|| (s.schema_json.clone(), s.schema_sig.clone())),
         responses: s
             .responses
@@ -266,6 +295,7 @@ mod tests {
         let schema = Schema {
             questions: vec![Question { id: "d".into(), kind: "avail".into(), options: vec!["mon".into(), "tue".into(), "wed".into()], required: true }],
             allowed: None,
+            rev: 0,
         };
         assert!(check_answers(&schema, r#"{"d":[1,0,2]}"#).is_ok());
         assert!(check_answers(&schema, r#"{"d":[1,0]}"#).is_err()); // wrong length
@@ -348,5 +378,37 @@ mod tests {
         let d = delta(&s, &Summary::default());
         assert!(d.schema.is_some() && d.responses.len() == 1);
         assert!(delta(&s, &summarize(&s)).responses.is_empty());
+    }
+
+    #[test]
+    fn title_rename() {
+        let o = sk(1);
+        let op = pk(&o);
+        let sign = |j: &str| hex::encode(o.sign(format!("fps1|{op}|{j}").as_bytes()).to_bytes());
+        let q = r#""questions":[{"id":"q1","kind":"single","options":["a","b"],"required":true}]"#;
+        let v0 = format!(r#"{{"title":"old",{q}}}"#);
+        let v1 = format!(r#"{{"title":"new","rev":1,{q}}}"#);
+        let v2 = format!(r#"{{"title":"newer","rev":2,{q}}}"#);
+        let changed = format!(r#"{{"title":"x","rev":3,"questions":[]}}"#);
+        let d = |j: &str| Delta { schema: Some((j.into(), sign(j))), ..Default::default() };
+
+        let mut s = FormState::default();
+        apply(&op, &mut s, d(&v0)).unwrap();
+        let (k, r) = resp(&op, &sk(2), 1, r#"{"q1":0}"#);
+        apply(&op, &mut s, Delta { responses: [(k, r)].into(), ..Default::default() }).unwrap();
+
+        apply(&op, &mut s, d(&v2)).unwrap();
+        apply(&op, &mut s, d(&v1)).unwrap(); // older rev ignored
+        assert_eq!(s.schema_json, v2);
+        validate(&op, &s).unwrap(); // existing answers still valid
+
+        assert!(apply(&op, &mut s, d(&changed)).is_err()); // body is fixed
+        let forged = Delta { schema: Some((format!(r#"{{"title":"evil","rev":9,{q}}}"#), sign(&v1))), ..Default::default() };
+        assert!(apply(&op, &mut s, forged).is_err()); // not signed by the owner
+
+        // peers behind on rev get the new schema in the delta
+        let behind = Summary { has_schema: true, schema_rev: 1, ..Default::default() };
+        assert!(delta(&s, &behind).schema.is_some());
+        assert!(delta(&s, &summarize(&s)).schema.is_none());
     }
 }
