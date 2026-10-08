@@ -430,6 +430,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freepolls-identity"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "freenet-stdlib",
+ "hex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "freepolls-registry"
 version = "0.1.0"
 dependencies = [

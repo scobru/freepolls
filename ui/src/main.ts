@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, watch,
+  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, storeGet, storePut, watch,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -20,15 +20,15 @@ function route() {
 // page URL without the container's ?__sandbox=1 query
 const pageUrl = (hash: string) => `${location.protocol}//${location.host}${location.pathname}${hash}`;
 
-// ---------------- my forms (per-browser list; ponytail: localStorage, lost if site data is cleared) ----------------
+// ---------------- my polls (kept by the identity delegate, or localStorage as a fallback) ----------------
 type Saved = { title: string; hash: string };
-const myForms = (): Saved[] => { try { return JSON.parse(localStorage.getItem("fp-polls") ?? "[]"); } catch { return []; } };
-const saveForm = (f: Saved) => { try { localStorage.setItem("fp-polls", JSON.stringify([f, ...myForms()])); } catch { /* storage blocked */ } };
+const myForms = async (): Promise<Saved[]> => { try { return JSON.parse((await storeGet("polls")) ?? "[]"); } catch { return []; } };
+const saveForm = async (f: Saved) => storePut("polls", JSON.stringify([f, ...(await myForms())]));
 
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "", inviteOnly = false, listed = false, nInvites = 10;
+  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [];
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
@@ -50,7 +50,8 @@ function builder() {
       <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your owner key become discoverable)</label>
       <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
-      ${myForms().length ? `<h2>My polls</h2><ul>${myForms().map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : ""}`;
+      <div id="mine"></div>`;
+    $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : "";
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
     $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; if (inviteOnly) listed = false; draw(); };
     $<HTMLInputElement>("#ls").onchange = (e) => (listed = (e.target as HTMLInputElement).checked);
@@ -84,7 +85,7 @@ function builder() {
         if (invites.length) schema.allowed = invites.map((i) => i.pk);
         const { instance, params } = await publish(schema);
         const hash = `#/f/${instance}.${params}`;
-        saveForm({ title: schema.title, hash });
+        await saveForm({ title: schema.title, hash });
         if (listed && !invites.length) {
           msg.textContent = "Listing in the public directory (a few seconds of proof-of-work)...";
           try { await listPoll(instance, params, schema.title.slice(0, 120)); }
@@ -92,12 +93,13 @@ function builder() {
         }
         if (!invites.length) return void (location.hash = hash);
         const secrets = invites.map((i) => i.secret);
-        try { localStorage.setItem(`fp-inv:${instance}`, JSON.stringify(secrets)); } catch { /* storage blocked */ }
+        await storePut(`inv:${instance}`, JSON.stringify(secrets));
         showInvites(hash, secrets);
       } catch (e) { msg.textContent = `Error: ${e}`; }
     };
   };
   draw();
+  void myForms().then((m) => { if (m.length) { mine = m; draw(); } });
 }
 
 // ---------------- public directory ----------------
@@ -161,7 +163,7 @@ async function form(instance: string, params: string, invite?: string) {
   const link = pageUrl(`#/f/${instance}.${params}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
   let savedInvites: string[] = [];
-  try { savedInvites = JSON.parse(localStorage.getItem(`fp-inv:${instance}`) ?? "[]"); } catch { /* storage blocked */ }
+  try { savedInvites = JSON.parse((await storeGet(`inv:${instance}`)) ?? "[]"); } catch { /* unreadable: no saved invites */ }
   const draw = () => {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
@@ -207,7 +209,7 @@ async function form(instance: string, params: string, invite?: string) {
         if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Missing: ${q.text}`);
       }
       $("#msg").textContent = "Sending...";
-      try { await sendResponse(instance, me.pk, await signAnswers(me.sk, params, me.pk, a)); await refresh(); }
+      try { await sendResponse(instance, me.pk, await signAnswers(me, params, a)); await refresh(); }
       catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "The node did not accept the answer (invite-only poll: you need your personal link)." : `Errore: ${err}`; }
     };
   };

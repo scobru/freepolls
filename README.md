@@ -5,6 +5,7 @@ Polls and forms on [Freenet](https://freenet.org). No server, no account: every 
 - **Contract**: Rust compiled to WASM (`contract/`).
 - **UI**: TypeScript + Vite, no framework (`ui/`). Talks to the node through [`@freenetorg/freenet-stdlib`](https://freenet.org/build/manual/typescript-sdk).
 - **Invite-only polls**: one personal link = one vote, no accounts and no external services.
+- **Stable identity**: the signing key and the owner's data live in a Freenet delegate, so they survive sessions even inside the sandboxed web container.
 - **Question types**: single choice, multiple choice, free text, and **availability** (Doodle-style: one yes / maybe / no per date slot, with the best slot highlighted). Required flag, reordering, live results.
 
 ## How it works
@@ -66,6 +67,17 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 - `main.ts`: hash router. `#/` is the poll builder, `#/f/<instance>.<params>[/i/<invite_secret>]`, `#/explore` is the public directory is the fill-in and results page. Inside the Freenet container the router also posts the hash to the shell so the address bar stays shareable. On an update notification the UI refetches the full state.
 - The bundled `ui/src/contract.wasm` is what gets published with each new poll. Rebuild and copy it after any contract change.
 
+## Identity delegate
+
+Inside the Freenet web container the page is sandboxed without storage, so a key kept in the page would be lost on every reload. The `delegate/` crate (`freepolls-identity`) keeps it in the node instead:
+
+- **Per-app identity.** One ed25519 key per calling web app. The namespace is the app's contract id, which the node attests, so another app cannot read or use this key. Local clients that are not a web app share one `dev` namespace.
+- **Signing.** The page sends `{"op":"sign","msg":"..."}` and receives the signature; the key is never sent back. The UI generates the key once and hands it over with `{"op":"init","sk":"..."}`, which is ignored if the delegate already holds one (that is also how a key from an earlier `localStorage` session is kept). The secret therefore passes through the page once.
+- **Small store.** `put` / `get` keep short strings under validated key names: the "My polls" list and the owner's invite links (otherwise lost with the page). Values are capped at 256 KB.
+- **Registration.** The UI registers the delegate on each load (the delegate code is bundled as `ui/src/identity.wasm`). The node ignores the cipher and nonce fields since freenet-core #4146 but still checks their sizes (32 and 24 bytes). The SDK has no delegate method yet, so the UI uses its low-level `sendRequest`. Delegate replies carry no request id, so calls are serialized and matched by order.
+- **Fallback.** If the delegate does not answer within 8 s, the UI falls back to `localStorage`, then to memory for the session (with a warning).
+- **Trust.** The delegate signs whatever the calling app asks, like a key kept in the page would. It protects the key from other apps and from storage loss, not from the app itself.
+
 ## Public directory
 
 Polls can opt in to a shared directory, shown on the **Explore** page. It is a second contract (`registry/`), one instance per admin key (the admin public key is its parameter).
@@ -86,9 +98,10 @@ Requirements: `rustup` with the `wasm32-unknown-unknown` target, `freenet` and `
 ```bash
 # contract: test, build, copy the wasm into the UI
 cargo test
-cargo build --release --target wasm32-unknown-unknown -p freepolls-contract -p freepolls-registry
+cargo build --release --target wasm32-unknown-unknown -p freepolls-contract -p freepolls-registry -p freepolls-identity
 cp target/wasm32-unknown-unknown/release/freepolls_contract.wasm ui/src/contract.wasm
 cp target/wasm32-unknown-unknown/release/freepolls_registry.wasm ui/src/registry.wasm
+cp target/wasm32-unknown-unknown/release/freepolls_identity.wasm ui/src/identity.wasm
 ```
 
 On Windows, make sure `~/.cargo/bin` comes before any standalone Rust install in `PATH`, otherwise `cargo` will not see the wasm target.
@@ -130,14 +143,14 @@ fdev website update dist --key freepolls
 
 - **Answers are public.** Anyone with the poll link can read the state. Do not collect personal or sensitive data: Freenet has no global delete, so published polls and answers cannot be withdrawn.
 - **Open polls: one response per key, not per person.** Anyone can generate more keys. Use an invite-only poll when the vote count matters.
-- **Key custody.** The respondent key lives in `localStorage`. Inside the Freenet web container the page is sandboxed without `allow-same-origin`, so storage is unavailable and the key lasts only for the session; the UI shows a warning. A delegate would fix this.
 - Changing the contract changes its code hash: polls already published keep running the old contract.
 - `subscribe()` does not resolve in local mode, so the UI does not wait for it.
 - No way to close a poll yet.
 
+- **The identity belongs to your node.** A different node or computer is a different identity (Freenet does not sync delegates across devices yet). Polls and answers stay valid; you just cannot edit them from the other node.
+
 ## Roadmap
 
-- Key custody in a Freenet delegate (stable identity, persistent "my polls").
 - Encrypted answers readable only by the owner.
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.

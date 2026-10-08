@@ -4,11 +4,16 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import {
   FreenetWsApi, ContractKey, ContractContainer, ContractType, WasmContractV1,
   PutRequest, GetRequest, SubscribeRequest, UpdateRequest, UpdateData, UpdateDataType, DeltaUpdate,
-  type ResponseHandler,
+  DelegateRequest, type DelegateResponse, type ResponseHandler,
 } from "@freenetorg/freenet-stdlib";
-import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
-import { RelatedContractsT } from "@freenetorg/freenet-stdlib/client-request";
+import { ApplicationMessageT, ContractCodeT } from "@freenetorg/freenet-stdlib/common";
+import {
+  ApplicationMessagesT, ClientRequestT, ClientRequestType, DelegateCodeT, DelegateContainerT, DelegateKeyT,
+  DelegateRequestType, DelegateType, InboundDelegateMsgT, InboundDelegateMsgType, RegisterDelegateT,
+  RelatedContractsT, WasmDelegateV1T,
+} from "@freenetorg/freenet-stdlib/client-request";
 import wasmUrl from "./contract.wasm?url";
+import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
 
 // ---- types mirroring contract/src/lib.rs ----
@@ -23,11 +28,88 @@ const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
 const enc = new TextEncoder();
 const bytes = (s: string) => Array.from(enc.encode(s));
 
-// ---- identity (one ed25519 key per browser; ponytail: localStorage, move to a delegate for real key custody) ----
-// Inside the Freenet web container the iframe is sandboxed without allow-same-origin: localStorage throws,
-// so the key lives in memory for the session only (`persisted: false`).
+// ---- identity ----
+// Signing identity: `sign` takes the message text and returns the hex signature.
+export interface Identity { pk: string; persisted: boolean; sign: (msg: string) => Promise<string> }
+
+const local = async (sk: Uint8Array, persisted: boolean): Promise<Identity> => ({
+  pk: hex(await ed.getPublicKeyAsync(sk)),
+  persisted,
+  sign: async (m) => hex(await ed.signAsync(enc.encode(m), sk)),
+});
+
+// Identity delegate: the key lives in the node (one per calling web app), so it survives sessions even
+// inside the sandboxed container where the page has no storage. The delegate is optional: if it is missing
+// or does not answer, the identity falls back to localStorage, or to memory for the session.
+const delegateWaiters: Array<(r: DelegateResponse) => void> = [];
+let delegateKey: DelegateKeyT | undefined;
+
+// Every delegate request, registration included, is answered by one DelegateResponse and the replies carry
+// no request id: calls go one at a time and are matched by order.
+let delegateChain: Promise<unknown> = Promise.resolve();
+function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
+  const run = async () => {
+    let waiter!: (r: DelegateResponse) => void;
+    const reply = new Promise<DelegateResponse>((resolve, reject) => {
+      waiter = resolve;
+      delegateWaiters.push(waiter);
+      setTimeout(() => {
+        const i = delegateWaiters.indexOf(waiter);
+        if (i >= 0) { delegateWaiters.splice(i, 1); reject(new Error("delegate timeout")); }
+      }, 8000);
+    });
+    // the SDK has no delegate method yet: use its low-level sender
+    const a = (await api()) as unknown as { sendRequest(r: ClientRequestT): void };
+    a.sendRequest(new ClientRequestT(ClientRequestType.DelegateRequest, req));
+    return reply;
+  };
+  const p = delegateChain.then(run);
+  delegateChain = p.catch(() => {});
+  return p;
+}
+
+async function registerDelegate() {
+  const code = new Uint8Array(await (await fetch(identityWasmUrl)).arrayBuffer());
+  const codeHash = blake3(code);
+  delegateKey = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash)); // empty params: blake3(codeHash)
+  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), delegateKey);
+  const container = new DelegateContainerT(DelegateType.WasmDelegateV1, wasm);
+  // the node ignores cipher and nonce since freenet-core PR #4146 (secrets use a node-side key) but still checks their sizes
+  await sendDelegate(new DelegateRequest(DelegateRequestType.RegisterDelegate, new RegisterDelegateT(container, new Array(32).fill(0), new Array(24).fill(0))));
+}
+
+async function callDelegate(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
+  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(bytes(JSON.stringify(payload)), [], false));
+  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(delegateKey, [], [msg])));
+  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
+  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
+  if (!m) throw new Error("empty delegate reply");
+  const out = JSON.parse(new TextDecoder().decode(new Uint8Array(m.payload)));
+  if (out.err) throw new Error(out.err);
+  return out;
+}
+
+let delegateIdentity: Promise<Identity | null> | undefined;
+function viaDelegate(): Promise<Identity | null> {
+  return (delegateIdentity ??= (async () => {
+    try {
+      await registerDelegate();
+      // keep the identity this browser already had (init only stores the key if the delegate has none)
+      let sk: string | null = null;
+      try { sk = localStorage.getItem("fp-sk"); } catch { /* sandbox: no storage */ }
+      const { pk } = await callDelegate({ op: "init", sk: sk ?? hex(ed.utils.randomPrivateKey()) });
+      return { pk, persisted: true, sign: async (msg: string) => (await callDelegate({ op: "sign", msg })).sig };
+    } catch (e) {
+      console.warn("identity delegate unavailable, using local key:", e);
+      return null;
+    }
+  })());
+}
+
 let memKey: string | undefined;
-export async function identity() {
+export async function identity(): Promise<Identity> {
+  const d = await viaDelegate();
+  if (d) return d;
   let h: string | null | undefined, persisted = true;
   try { h = localStorage.getItem("fp-sk"); } catch { persisted = false; h = memKey; }
   if (!h) {
@@ -35,15 +117,33 @@ export async function identity() {
     try { localStorage.setItem("fp-sk", h); } catch { persisted = false; }
   }
   memKey = h;
-  const sk = unhex(h);
-  return { sk, pk: hex(await ed.getPublicKeyAsync(sk)), persisted };
+  return local(unhex(h), persisted);
 }
 
-/** Identity from an invite secret carried in the link (works without storage, e.g. in the sandboxed container). */
-export async function identityFrom(secretHex: string) {
-  const sk = unhex(secretHex);
-  return { sk, pk: hex(await ed.getPublicKeyAsync(sk)), persisted: true };
+// ---- small per-browser store (poll list, owner's invite links): the delegate when available, else localStorage ----
+const mem = new Map<string, string>();
+const lsKey = (k: string) => `fp-${k}`;
+
+export async function storeGet(key: string): Promise<string | null> {
+  const d = await viaDelegate();
+  let local: string | null = null;
+  try { local = localStorage.getItem(lsKey(key)); } catch { /* sandbox: no storage */ }
+  if (d) {
+    try { return (await callDelegate({ op: "get", key })).value ?? local; } catch { /* use local */ }
+  }
+  return local ?? mem.get(key) ?? null;
 }
+
+export async function storePut(key: string, value: string) {
+  mem.set(key, value);
+  try { localStorage.setItem(lsKey(key), value); } catch { /* sandbox: no storage */ }
+  if (await viaDelegate()) {
+    try { await callDelegate({ op: "put", key, value }); } catch (e) { console.warn("delegate store failed:", e); }
+  }
+}
+
+/** Identity from an invite secret carried in the link (works without storage or delegate). */
+export const identityFrom = (secretHex: string) => local(unhex(secretHex), true);
 
 /** Fresh invite keypairs: the secret goes into the personal link, the pubkey into the signed schema. */
 export async function newInvites(n: number) {
@@ -54,12 +154,9 @@ export async function newInvites(n: number) {
 }
 
 // ---- signing: message formats must match the contract ----
-export const signSchema = async (sk: Uint8Array, params: string, schema_json: string) =>
-  hex(await ed.signAsync(enc.encode(`fps1|${params}|${schema_json}`), sk));
-
-export async function signAnswers(sk: Uint8Array, params: string, pk: string, answers: Answers): Promise<Response> {
+export async function signAnswers(who: Identity, params: string, answers: Answers): Promise<Response> {
   const ts = Date.now(), answers_json = JSON.stringify(answers);
-  return { ts, answers_json, sig: hex(await ed.signAsync(enc.encode(`fpr1|${params}|${pk}|${ts}|${answers_json}`), sk)) };
+  return { ts, answers_json, sig: await who.sign(`fpr1|${params}|${who.pk}|${ts}|${answers_json}`) };
 }
 
 // ---- node connection ----
@@ -77,7 +174,7 @@ export function api(): Promise<FreenetWsApi> {
       onContractPut() {}, onContractGet() {}, onContractUpdate() {},
       onContractUpdateNotification: () => listeners.forEach((l) => l()),
       onContractNotFound: () => console.warn("contract not found"),
-      onDelegateResponse() {},
+      onDelegateResponse: (r) => delegateWaiters.shift()?.(r),
       onErr: (e) => { console.error(e.cause); alert(e.cause); },
       onOpen: () => resolve(a),
       onClose: () => { apiP = undefined; reject(new Error("socket closed")); },
@@ -135,10 +232,10 @@ async function putContract(wasm: string, params: Uint8Array, state: object) {
 
 /** Publish a new poll. Parameters = owner pubkey || random salt, so one owner can run many polls. */
 export async function publish(schema: Schema) {
-  const { sk, pk } = await identity();
-  const params = pk + hex(crypto.getRandomValues(new Uint8Array(16)));
+  const me = await identity();
+  const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
   const schema_json = JSON.stringify(schema);
-  const state: FormState = { schema_json, schema_sig: await signSchema(sk, params, schema_json), responses: {} };
+  const state: FormState = { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), responses: {} };
   return { instance: await putContract(wasmUrl, unhex(params), state), params };
 }
 
@@ -170,9 +267,9 @@ const zeroBits = (h: Uint8Array) => {
 
 /** List a poll you own: sign the entry and mine the proof-of-work (a few seconds). */
 export async function listPoll(instance: string, params: string, title: string) {
-  const { sk } = await identity(); // must be the poll owner (first 32 bytes of params)
+  const me = await identity(); // must be the poll owner (first 32 bytes of params)
   const ts = Date.now(), msg = `fpl1|${instance}|${params}|${title}|${ts}`;
-  const sig = hex(await ed.signAsync(enc.encode(msg), sk));
+  const sig = await me.sign(msg);
   let nonce = 0;
   while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < POW_BITS) {
     if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
