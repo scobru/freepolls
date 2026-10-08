@@ -41,17 +41,31 @@ const local = async (sk: Uint8Array, persisted: boolean): Promise<Identity> => (
 // Identity delegate: the key lives in the node (one per calling web app), so it survives sessions even
 // inside the sandboxed container where the page has no storage. The delegate is optional: if it is missing
 // or does not answer, the identity falls back to localStorage, or to memory for the session.
-const delegateWaiters: Array<(r: DelegateResponse) => void> = [];
+interface Waiter { resolve(r: DelegateResponse): void; reject(e: Error): void }
+const delegateWaiters: Waiter[] = [];
 let delegateKey: DelegateKeyT | undefined;
+
+// The socket can drop right after the page opens (for example while the shell re-authenticates), which
+// would otherwise fail the first load until a manual refresh: retry a couple of times.
+async function retrying<T>(f: () => Promise<T>, tries = 3): Promise<T> {
+  for (let i = 1; ; i++) {
+    try { return await f(); }
+    catch (e) {
+      if (i >= tries || !/closed/i.test(String(e))) throw e;
+      console.warn(`connection dropped, retrying (${i}/${tries - 1}):`, e);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+}
 
 // Every delegate request, registration included, is answered by one DelegateResponse and the replies carry
 // no request id: calls go one at a time and are matched by order.
 let delegateChain: Promise<unknown> = Promise.resolve();
 function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
   const run = async () => {
-    let waiter!: (r: DelegateResponse) => void;
+    let waiter!: Waiter;
     const reply = new Promise<DelegateResponse>((resolve, reject) => {
-      waiter = resolve;
+      waiter = { resolve, reject };
       delegateWaiters.push(waiter);
       setTimeout(() => {
         const i = delegateWaiters.indexOf(waiter);
@@ -78,7 +92,10 @@ async function registerDelegate() {
   await sendDelegate(new DelegateRequest(DelegateRequestType.RegisterDelegate, new RegisterDelegateT(container, new Array(32).fill(0), new Array(24).fill(0))));
 }
 
-async function callDelegate(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
+// every delegate operation is safe to repeat (init keeps the first key, the rest are reads, signatures and overwrites)
+const callDelegate = (payload: object) => retrying(() => callDelegateOnce(payload));
+
+async function callDelegateOnce(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
   const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(bytes(JSON.stringify(payload)), [], false));
   const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(delegateKey, [], [msg])));
   // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
@@ -93,11 +110,13 @@ let delegateIdentity: Promise<Identity | null> | undefined;
 function viaDelegate(): Promise<Identity | null> {
   return (delegateIdentity ??= (async () => {
     try {
-      await registerDelegate();
-      // keep the identity this browser already had (init only stores the key if the delegate has none)
-      let sk: string | null = null;
-      try { sk = localStorage.getItem("fp-sk"); } catch { /* sandbox: no storage */ }
-      const { pk } = await callDelegate({ op: "init", sk: sk ?? hex(ed.utils.randomPrivateKey()) });
+      const { pk } = await retrying(async () => {
+        await registerDelegate();
+        // keep the identity this browser already had (init only stores the key if the delegate has none)
+        let sk: string | null = null;
+        try { sk = localStorage.getItem("fp-sk"); } catch { /* sandbox: no storage */ }
+        return callDelegate({ op: "init", sk: sk ?? hex(ed.utils.randomPrivateKey()) });
+      });
       return { pk, persisted: true, sign: async (msg: string) => (await callDelegate({ op: "sign", msg })).sig };
     } catch (e) {
       console.warn("identity delegate unavailable, using local key:", e);
@@ -174,10 +193,14 @@ export function api(): Promise<FreenetWsApi> {
       onContractPut() {}, onContractGet() {}, onContractUpdate() {},
       onContractUpdateNotification: () => listeners.forEach((l) => l()),
       onContractNotFound: () => console.warn("contract not found"),
-      onDelegateResponse: (r) => delegateWaiters.shift()?.(r),
+      onDelegateResponse: (r) => delegateWaiters.shift()?.resolve(r),
       onErr: (e) => { console.error(e.cause); alert(e.cause); },
       onOpen: () => resolve(a),
-      onClose: () => { apiP = undefined; reject(new Error("socket closed")); },
+      onClose: () => {
+        apiP = undefined;
+        delegateWaiters.splice(0).forEach((w) => w.reject(new Error("socket closed"))); // their replies will never come
+        reject(new Error("socket closed"));
+      },
     };
     const a = new FreenetWsApi(url, h, ""); // empty token inside the web container shell
   }));
@@ -197,11 +220,11 @@ const keyOf = (instanceB58: string) => keys.get(instanceB58) ?? ContractKey.from
 
 /** Fetch a contract's JSON state. */
 export const loadJson = <T>(instance: string) =>
-  serial(async () => {
+  serial(() => retrying(async () => {
     const r = await (await api()).get(new GetRequest(keyOf(instance), false));
     if (r.key?.codePart()?.length === 32) keys.set(instance, r.key);
     return JSON.parse(new TextDecoder().decode(new Uint8Array(r.state))) as T;
-  });
+  }));
 export const loadState = (instance: string) => loadJson<FormState>(instance);
 
 export async function watch(instance: string) {
