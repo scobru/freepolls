@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, storeGet, storePut, watch,
+  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, rename, sendResponse, signAnswers, storeGet, storePut, watch,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -177,6 +177,7 @@ async function form(instance: string, params: string, invite?: string) {
     app.innerHTML = `
       <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
+      ${own ? `<p><button id="ren" type="button">Rename</button> <span id="ren-msg" class="muted"></span></p>` : ""}
       ${intro}
       ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
       <form id="f" ${invited ? "" : "hidden"}>
@@ -199,6 +200,13 @@ async function form(instance: string, params: string, invite?: string) {
       </form>
       <h2>Results (${n} ${n === 1 ? "response" : "responses"})</h2>
       ${results()}`;
+    const renBtn = app.querySelector<HTMLButtonElement>("#ren");
+    if (renBtn) renBtn.onclick = async () => {
+      const t = prompt("New title", schema.title)?.trim();
+      if (!t || t === schema.title) return;
+      try { await rename(instance, params, schema, t); await refresh(); }
+      catch (err) { $("#ren-msg").textContent = `Rename failed: ${err}`; }
+    };
     const listBtn = app.querySelector<HTMLButtonElement>("#list-btn");
     if (listBtn) listBtn.onclick = async () => {
       const m = $("#list-msg");
@@ -249,6 +257,7 @@ async function form(instance: string, params: string, invite?: string) {
     // skip redraw while the user is typing in the form
     const typing = app.contains(document.activeElement) && document.activeElement instanceof HTMLTextAreaElement;
     st = await loadState(instance);
+    schema = JSON.parse(st.schema_json);
     if (!typing) draw();
   };
   onRemoteChange(() => void refresh()); // ponytail: refetch full state on notification; use deltas if responses get large

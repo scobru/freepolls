@@ -19,7 +19,7 @@ import registryWasmUrl from "./registry.wasm?url";
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
-export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
+export interface Schema { title: string; questions: Question[]; allowed?: string[]; rev?: number } // allowed = invited pubkeys (hex), absent = open poll
 export interface Response { ts: number; answers_json: string; sig: string }
 export interface FormState { schema_json: string; schema_sig: string; responses: Record<string, Response> }
 export type Answers = Record<string, number | number[] | string>;
@@ -237,6 +237,13 @@ async function sendDelta(instance: string, delta: object) {
 }
 export const sendResponse = (instance: string, pk: string, r: Response) =>
   sendDelta(instance, { schema: null, responses: { [pk]: r } });
+
+/** Owner only: sign a new schema with the same questions and a new title. The contract keeps the highest rev. */
+export async function rename(instance: string, params: string, schema: Schema, title: string) {
+  const schema_json = JSON.stringify({ ...schema, title, rev: (schema.rev ?? 0) + 1 });
+  const sig = await (await identity()).sign(`fps1|${params}|${schema_json}`);
+  await sendDelta(instance, { schema: [schema_json, sig], responses: {} });
+}
 
 /** Contract code + key. Instance id = blake3(blake3(wasm) || params), same as freenet-stdlib. */
 async function build(wasm: string, params: Uint8Array) {
