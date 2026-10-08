@@ -169,7 +169,7 @@ export function api(): Promise<FreenetWsApi> {
   return (apiP ??= new Promise((resolve, reject) => {
     const url = new URL(import.meta.env.DEV
       ? `ws://${import.meta.env.VITE_NODE ?? "127.0.0.1:7509"}/v1/contract/command`
-      : `ws://${location.host}/v1/contract/command`);
+      : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/contract/command`); // the shell only proxies sockets to its own origin, scheme included
     const h: ResponseHandler = {
       onContractPut() {}, onContractGet() {}, onContractUpdate() {},
       onContractUpdateNotification: () => listeners.forEach((l) => l()),
