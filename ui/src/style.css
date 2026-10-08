@@ -21,3 +21,6 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 footer { max-width: 640px; margin: 0 auto; padding: 0 16px 32px; font-size: .85em; opacity: .7; }
 footer a, main a { color: var(--accent); }
 details { margin: 8px 0; } details textarea { width: 100%; }
+
+/* builder options: one per line */
+main > label { display: block; margin: 6px 0; }
