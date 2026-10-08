@@ -9,11 +9,11 @@ Polls and forms on [Freenet](https://freenet.org). No server, no account: every 
 
 ## How it works
 
-One contract instance per poll. The contract **parameters** are the owner's ed25519 public key (32 bytes), so every owner gets a distinct address:
+One contract instance per poll. The contract **parameters** are the owner's ed25519 public key (32 bytes) followed by a random 16-byte salt. The salt gives every poll its own address, so one owner can run any number of polls:
 
 ```
 code_hash   = blake3(contract.wasm)
-instance_id = blake3(code_hash || owner_pubkey)
+instance_id = blake3(code_hash || owner_pubkey || salt)
 ```
 
 The UI computes the same id before publishing (same derivation as `freenet-stdlib`), so the link is known up front.
@@ -34,7 +34,7 @@ The UI computes the same id before publishing (same derivation as `freenet-stdli
 
 The schema may carry `"allowed": ["<pubkey hex>", ...]` (up to 1000 keys, signed by the owner together with the rest of the schema). When present, the contract accepts responses **only from those keys**.
 
-At creation the UI generates one ed25519 keypair per invite: the public key goes into `allowed`, the secret goes into the personal link `#/f/<instance>.<owner>/i/<secret>`. Opening that link makes the browser sign as that invite, so it works even without local storage (for example inside the Freenet web container). One invite = one vote; reopening the link lets the invitee change their answer.
+At creation the UI generates one ed25519 keypair per invite: the public key goes into `allowed`, the secret goes into the personal link `#/f/<instance>.<params>/i/<secret>`. Opening that link makes the browser sign as that invite, so it works even without local storage (for example inside the Freenet web container). One invite = one vote; reopening the link lets the invitee change their answer.
 
 - The invite secrets exist only in the browser that created the poll. They are shown once after publishing and, where `localStorage` is available, kept so the owner can see them again. They cannot be recomputed.
 - The number of invites is fixed when the poll is created.
@@ -49,10 +49,10 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 
 | What | Signer | Message |
 | --- | --- | --- |
-| Schema | owner | `fps1\|<schema_json>` |
-| Answers | respondent | `fpr1\|<owner_hex>\|<respondent_hex>\|<ts>\|<answers_json>` |
+| Schema | owner | `fps1\|<params_hex>\|<schema_json>` |
+| Answers | respondent | `fpr1\|<params_hex>\|<respondent_hex>\|<ts>\|<answers_json>` |
 
-Including the owner key in the answer message stops a response from being replayed into another poll.
+`params_hex` is the full contract parameters (owner key plus salt). Binding both messages to it stops a signed schema from being cloned into another poll, and stops a response from being replayed into another poll, even one by the same owner.
 
 ### Contract rules (`contract/src/lib.rs`)
 
@@ -63,8 +63,21 @@ Including the owner key in the answer message stops a response from being replay
 ### UI (`ui/src/`)
 
 - `lib.ts`: ed25519 identity (stored key or invite secret) and signing (`@noble/ed25519`), blake3 key derivation, WebSocket API wrapper, publish / get / update / subscribe.
-- `main.ts`: hash router. `#/` is the poll builder, `#/f/<instance>.<owner_pubkey>[/i/<invite_secret>]` is the fill-in and results page. Inside the Freenet container the router also posts the hash to the shell so the address bar stays shareable. On an update notification the UI refetches the full state.
+- `main.ts`: hash router. `#/` is the poll builder, `#/f/<instance>.<params>[/i/<invite_secret>]`, `#/explore` is the public directory is the fill-in and results page. Inside the Freenet container the router also posts the hash to the shell so the address bar stays shareable. On an update notification the UI refetches the full state.
 - The bundled `ui/src/contract.wasm` is what gets published with each new poll. Rebuild and copy it after any contract change.
+
+## Public directory
+
+Polls can opt in to a shared directory, shown on the **Explore** page. It is a second contract (`registry/`), one instance per admin key (the admin public key is its parameter).
+
+- **Listing.** In the builder, tick "List in the public directory" (off by default, never available for invite-only polls). The UI signs an entry `fpl1|<instance>|<params>|<title>|<ts>` with the owner key and attaches a proof-of-work nonce.
+- **Proof-of-work.** `sha256("<message>|<nonce>")` must start with 18 zero bits (about 260k hashes, a few seconds in the browser). It makes bulk spam costly, but a determined flooder can still push older polls out.
+- **Size.** The newest 500 entries are kept (deterministic pruning, so merge order does not matter). Titles are limited to 120 characters.
+- **Moderation.** The admin key can publish a signed blocklist (`fpb1|<ts>|<ids>`); blocked polls vanish from the directory and cannot be re-added. The admin page is at `#/admin` (not linked anywhere): paste the admin secret and the ids to hide. Entries are not checked against the polls themselves, so an entry can point to a poll that does not exist.
+- **Bootstrap.** The directory address is derived from its code and the admin key, so the UI can compute it. The first visitor on a node creates it empty; that first load can take up to 30 s.
+- **Privacy.** Listing makes the title and the owner key discoverable. Publishing is permanent: there is no global delete on Freenet.
+
+The admin public key is `REGISTRY_ADMIN` in `ui/src/lib.ts`. The secret is not in the repo (`.secrets/` is ignored). Changing the admin key, or the registry code, creates a new, empty directory.
 
 ## Development
 
@@ -73,8 +86,9 @@ Requirements: `rustup` with the `wasm32-unknown-unknown` target, `freenet` and `
 ```bash
 # contract: test, build, copy the wasm into the UI
 cargo test
-cargo build --release --target wasm32-unknown-unknown -p freepolls-contract
+cargo build --release --target wasm32-unknown-unknown -p freepolls-contract -p freepolls-registry
 cp target/wasm32-unknown-unknown/release/freepolls_contract.wasm ui/src/contract.wasm
+cp target/wasm32-unknown-unknown/release/freepolls_registry.wasm ui/src/registry.wasm
 ```
 
 On Windows, make sure `~/.cargo/bin` comes before any standalone Rust install in `PATH`, otherwise `cargo` will not see the wasm target.
@@ -127,6 +141,7 @@ fdev website update dist --key freepolls
 - Encrypted answers readable only by the owner.
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.
+- Directory: re-check entries against the polls themselves, search, pagination.
 - Optional anti-spam stamps for open polls ([ante](https://github.com/soudasuwa/ante) proof-of-work or [Ghost Keys](https://freenet.org/ghostkey/)). Both only raise the cost of fake identities; neither proves one person = one vote.
 - Re-issue or add invites after creation.
 

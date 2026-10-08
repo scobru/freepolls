@@ -1,4 +1,6 @@
-//! Form/poll contract. One contract instance per form; parameters = owner ed25519 pubkey (32 bytes).
+//! Form/poll contract. One contract instance per poll.
+//! Parameters = owner ed25519 pubkey (32 bytes) || random salt. The salt makes every poll address unique,
+//! even for the same owner; all signed messages are bound to the full parameters.
 //! State is JSON. Schema and answers travel as the exact signed strings, so no canonicalization needed.
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
@@ -68,8 +70,9 @@ fn verify(k: &VerifyingKey, msg: &[u8], sig_hex: &str) -> R<()> {
     k.verify(msg, &sig).map_err(|_| "bad signature".to_string())
 }
 
-fn parse_schema(owner: &str, schema_json: &str, sig: &str) -> R<Schema> {
-    verify(&key(owner)?, format!("fps1|{schema_json}").as_bytes(), sig)?;
+fn parse_schema(params: &str, schema_json: &str, sig: &str) -> R<Schema> {
+    let owner = params.get(..64).ok_or("params too short")?;
+    verify(&key(owner)?, format!("fps1|{params}|{schema_json}").as_bytes(), sig)?;
     let schema: Schema = serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
     if let Some(a) = &schema.allowed {
         if a.len() > MAX_INVITES {
@@ -110,35 +113,35 @@ fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
     Ok(())
 }
 
-fn check_response(owner: &str, schema: &Schema, who: &str, r: &Response) -> R<()> {
+fn check_response(params: &str, schema: &Schema, who: &str, r: &Response) -> R<()> {
     if schema.allowed.as_ref().is_some_and(|a| !a.iter().any(|k| k == who)) {
         return Err("respondent not invited".into());
     }
-    let msg = format!("fpr1|{owner}|{who}|{}|{}", r.ts, r.answers_json);
+    let msg = format!("fpr1|{params}|{who}|{}|{}", r.ts, r.answers_json);
     verify(&key(who)?, msg.as_bytes(), &r.sig)?;
     check_answers(schema, &r.answers_json)
 }
 
-pub fn validate(owner: &str, s: &FormState) -> R<()> {
-    let schema = parse_schema(owner, &s.schema_json, &s.schema_sig)?;
-    s.responses.iter().try_for_each(|(who, r)| check_response(owner, &schema, who, r))
+pub fn validate(params: &str, s: &FormState) -> R<()> {
+    let schema = parse_schema(params, &s.schema_json, &s.schema_sig)?;
+    s.responses.iter().try_for_each(|(who, r)| check_response(params, &schema, who, r))
 }
 
 /// Merge a delta into state: schema is set once, per-respondent last-write-wins by ts.
-pub fn apply(owner: &str, s: &mut FormState, d: Delta) -> R<()> {
+pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
     if let Some((json, sig)) = d.schema {
         if s.schema_json.is_empty() {
-            parse_schema(owner, &json, &sig)?;
+            parse_schema(params, &json, &sig)?;
             s.schema_json = json;
             s.schema_sig = sig;
         }
     }
-    let schema = parse_schema(owner, &s.schema_json, &s.schema_sig)?;
+    let schema = parse_schema(params, &s.schema_json, &s.schema_sig)?;
     for (who, r) in d.responses {
         if s.responses.get(&who).is_some_and(|old| old.ts >= r.ts) {
             continue;
         }
-        check_response(owner, &schema, &who, &r)?;
+        check_response(params, &schema, &who, &r)?;
         s.responses.insert(who, r);
     }
     Ok(())
@@ -166,7 +169,7 @@ pub fn delta(s: &FormState, sum: &Summary) -> Delta {
 
 // ---- Freenet glue ----
 
-fn owner(p: &Parameters) -> Result<String, ContractError> {
+fn params_hex(p: &Parameters) -> Result<String, ContractError> {
     Ok(hex::encode(p.as_ref()))
 }
 
@@ -193,7 +196,7 @@ impl ContractInterface for Contract {
         _related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
         let s: FormState = de(state.as_ref())?;
-        Ok(match validate(&owner(&parameters)?, &s) {
+        Ok(match validate(&params_hex(&parameters)?, &s) {
             Ok(()) => ValidateResult::Valid,
             Err(_) => ValidateResult::Invalid,
         })
@@ -204,7 +207,7 @@ impl ContractInterface for Contract {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        let owner = owner(&parameters)?;
+        let params = params_hex(&parameters)?;
         let mut s: FormState = de_or_default(state.as_ref())?;
         for u in data {
             let d: Delta = match u {
@@ -219,7 +222,7 @@ impl ContractInterface for Contract {
                 UpdateData::StateAndDelta { delta, .. } => de(delta.as_ref())?,
                 _ => return Err(ContractError::InvalidUpdate),
             };
-            apply(&owner, &mut s, d).map_err(|_| ContractError::InvalidUpdate)?;
+            apply(&params, &mut s, d).map_err(|_| ContractError::InvalidUpdate)?;
         }
         Ok(UpdateModification::valid(State::from(ser(&s)?)))
     }
@@ -253,8 +256,8 @@ mod tests {
     }
     const SCHEMA: &str = r#"{"questions":[{"id":"q1","kind":"single","options":["a","b"],"required":true}]}"#;
 
-    fn resp(owner: &str, who: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
-        let msg = format!("fpr1|{owner}|{}|{ts}|{ans}", pk(who));
+    fn resp(params: &str, who: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
+        let msg = format!("fpr1|{params}|{}|{ts}|{ans}", pk(who));
         (pk(who), Response { ts, answers_json: ans.into(), sig: hex::encode(who.sign(msg.as_bytes()).to_bytes()) })
     }
 
@@ -280,7 +283,7 @@ mod tests {
             r#"{{"questions":[{{"id":"q1","kind":"single","options":["a","b"],"required":true}}],"allowed":["{}"]}}"#,
             pk(&invited)
         );
-        let sig = hex::encode(o.sign(format!("fps1|{schema}").as_bytes()).to_bytes());
+        let sig = hex::encode(o.sign(format!("fps1|{op}|{schema}").as_bytes()).to_bytes());
         let mut s = FormState::default();
         let (k, r) = resp(&op, &invited, 1, r#"{"q1":0}"#);
         apply(&op, &mut s, Delta { schema: Some((schema, sig)), responses: [(k, r)].into() }).unwrap();
@@ -290,15 +293,33 @@ mod tests {
 
         // malformed invite key rejected at schema level
         let bad = r#"{"questions":[],"allowed":["zz"]}"#;
-        let bad_sig = hex::encode(o.sign(format!("fps1|{bad}").as_bytes()).to_bytes());
+        let bad_sig = hex::encode(o.sign(format!("fps1|{op}|{bad}").as_bytes()).to_bytes());
         assert!(parse_schema(&op, bad, &bad_sig).is_err());
+    }
+
+    #[test]
+    fn salted_params_bind_everything() {
+        let o = sk(1);
+        let params_a = format!("{}{}", pk(&o), "aa".repeat(16));
+        let params_b = format!("{}{}", pk(&o), "bb".repeat(16));
+        let sig_a = hex::encode(o.sign(format!("fps1|{params_a}|{SCHEMA}").as_bytes()).to_bytes());
+        // valid for its own params, rejected under the same owner's other poll (no cloning of signed schemas)
+        parse_schema(&params_a, SCHEMA, &sig_a).unwrap();
+        assert!(parse_schema(&params_b, SCHEMA, &sig_a).is_err());
+        // answers are bound to the poll too
+        let mut s = FormState::default();
+        let d = Delta { schema: Some((SCHEMA.into(), sig_a)), ..Default::default() };
+        apply(&params_a, &mut s, d).unwrap();
+        let (k, r) = resp(&params_b, &sk(2), 1, r#"{"q1":0}"#);
+        assert!(apply(&params_a, &mut s, Delta { responses: [(k, r)].into(), ..Default::default() }).is_err());
+        assert!(parse_schema("abcd", SCHEMA, "00").is_err()); // too short
     }
 
     #[test]
     fn merge_flow() {
         let o = sk(1);
         let op = pk(&o);
-        let sig = hex::encode(o.sign(format!("fps1|{SCHEMA}").as_bytes()).to_bytes());
+        let sig = hex::encode(o.sign(format!("fps1|{op}|{SCHEMA}").as_bytes()).to_bytes());
         let mut s = FormState::default();
         let mut d = Delta { schema: Some((SCHEMA.into(), sig)), ..Default::default() };
         let (k, r) = resp(&op, &sk(2), 1, r#"{"q1":0}"#);

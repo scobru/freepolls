@@ -1,5 +1,6 @@
 import * as ed from "@noble/ed25519";
 import { blake3 } from "@noble/hashes/blake3.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import {
   FreenetWsApi, ContractKey, ContractContainer, ContractType, WasmContractV1,
   PutRequest, GetRequest, SubscribeRequest, UpdateRequest, UpdateData, UpdateDataType, DeltaUpdate,
@@ -8,6 +9,7 @@ import {
 import { ContractCodeT } from "@freenetorg/freenet-stdlib/common";
 import { RelatedContractsT } from "@freenetorg/freenet-stdlib/client-request";
 import wasmUrl from "./contract.wasm?url";
+import registryWasmUrl from "./registry.wasm?url";
 
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
@@ -52,12 +54,12 @@ export async function newInvites(n: number) {
 }
 
 // ---- signing: message formats must match the contract ----
-export const signSchema = async (sk: Uint8Array, schema_json: string) =>
-  hex(await ed.signAsync(enc.encode(`fps1|${schema_json}`), sk));
+export const signSchema = async (sk: Uint8Array, params: string, schema_json: string) =>
+  hex(await ed.signAsync(enc.encode(`fps1|${params}|${schema_json}`), sk));
 
-export async function signAnswers(sk: Uint8Array, owner: string, pk: string, answers: Answers): Promise<Response> {
+export async function signAnswers(sk: Uint8Array, params: string, pk: string, answers: Answers): Promise<Response> {
   const ts = Date.now(), answers_json = JSON.stringify(answers);
-  return { ts, answers_json, sig: hex(await ed.signAsync(enc.encode(`fpr1|${owner}|${pk}|${ts}|${answers_json}`), sk)) };
+  return { ts, answers_json, sig: hex(await ed.signAsync(enc.encode(`fpr1|${params}|${pk}|${ts}|${answers_json}`), sk)) };
 }
 
 // ---- node connection ----
@@ -96,32 +98,93 @@ const serial = <T>(f: () => Promise<T>): Promise<T> => {
 const keys = new Map<string, ContractKey>();
 const keyOf = (instanceB58: string) => keys.get(instanceB58) ?? ContractKey.fromInstanceId(instanceB58);
 
-export const loadState = (instance: string) =>
+/** Fetch a contract's JSON state. */
+export const loadJson = <T>(instance: string) =>
   serial(async () => {
     const r = await (await api()).get(new GetRequest(keyOf(instance), false));
     if (r.key?.codePart()?.length === 32) keys.set(instance, r.key);
-    return JSON.parse(new TextDecoder().decode(new Uint8Array(r.state))) as FormState;
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(r.state))) as T;
   });
+export const loadState = (instance: string) => loadJson<FormState>(instance);
 
 export async function watch(instance: string) {
   await (await api()).subscribe(new SubscribeRequest(keyOf(instance)));
 }
 
-export async function sendResponse(instance: string, pk: string, r: Response) {
-  const delta = bytes(JSON.stringify({ schema: null, responses: { [pk]: r } }));
-  await (await api()).update(new UpdateRequest(keyOf(instance), new UpdateData(UpdateDataType.DeltaUpdate, new DeltaUpdate(delta))));
+async function sendDelta(instance: string, delta: object) {
+  const d = bytes(JSON.stringify(delta));
+  await (await api()).update(new UpdateRequest(keyOf(instance), new UpdateData(UpdateDataType.DeltaUpdate, new DeltaUpdate(d))));
+}
+export const sendResponse = (instance: string, pk: string, r: Response) =>
+  sendDelta(instance, { schema: null, responses: { [pk]: r } });
+
+/** Contract code + key. Instance id = blake3(blake3(wasm) || params), same as freenet-stdlib. */
+async function build(wasm: string, params: Uint8Array) {
+  const code = new Uint8Array(await (await fetch(wasm)).arrayBuffer());
+  const codeHash = blake3(code);
+  const key = new ContractKey(blake3(new Uint8Array([...codeHash, ...params])), codeHash);
+  return { code, codeHash, key };
 }
 
-/** Publish a new form. Instance id = blake3(blake3(wasm) || owner pubkey), same as freenet-stdlib. */
+async function putContract(wasm: string, params: Uint8Array, state: object) {
+  const { code, codeHash, key } = await build(wasm, params);
+  const contract = new WasmContractV1(new ContractCodeT(Array.from(code), Array.from(codeHash)), Array.from(params), key);
+  await (await api()).put(new PutRequest(new ContractContainer(ContractType.WasmContractV1, contract), bytes(JSON.stringify(state)), new RelatedContractsT()));
+  return key.encode();
+}
+
+/** Publish a new poll. Parameters = owner pubkey || random salt, so one owner can run many polls. */
 export async function publish(schema: Schema) {
   const { sk, pk } = await identity();
-  const code = new Uint8Array(await (await fetch(wasmUrl)).arrayBuffer());
-  const codeHash = blake3(code), owner = unhex(pk);
-  const instance = blake3(new Uint8Array([...codeHash, ...owner]));
-  const key = new ContractKey(instance, codeHash);
-  const contract = new WasmContractV1(new ContractCodeT(Array.from(code), Array.from(codeHash)), Array.from(owner), key);
+  const params = pk + hex(crypto.getRandomValues(new Uint8Array(16)));
   const schema_json = JSON.stringify(schema);
-  const state: FormState = { schema_json, schema_sig: await signSchema(sk, schema_json), responses: {} };
-  await (await api()).put(new PutRequest(new ContractContainer(ContractType.WasmContractV1, contract), bytes(JSON.stringify(state)), new RelatedContractsT()));
-  return { instance: key.encode(), owner: pk };
+  const state: FormState = { schema_json, schema_sig: await signSchema(sk, params, schema_json), responses: {} };
+  return { instance: await putContract(wasmUrl, unhex(params), state), params };
+}
+
+// ---- public directory (registry contract, see registry/src/lib.rs) ----
+// The registry address depends on the admin key (its parameter): changing the key creates a new directory.
+export const REGISTRY_ADMIN = "4f3738821e50c271f498aa23a5a569802a418768c84d2a6bd7f643a2d3359d6c";
+const POW_BITS = 18; // must match the contract (sha256, about 3 s of mining)
+export interface RegEntry { params: string; title: string; ts: number; nonce: number; sig: string }
+export interface RegState { entries: Record<string, RegEntry>; blocked: { ts: number; list: string[]; sig: string } }
+
+let regId: Promise<string> | undefined;
+const registryId = () => (regId ??= build(registryWasmUrl, unhex(REGISTRY_ADMIN)).then((b) => b.key.encode()));
+
+/** Load the directory. The first visitor on a node creates it (empty). */
+export async function loadRegistry(): Promise<RegState> {
+  const id = await registryId();
+  try { return await loadJson<RegState>(id); }
+  catch {
+    await putContract(registryWasmUrl, unhex(REGISTRY_ADMIN), { entries: {}, blocked: { ts: 0, list: [], sig: "" } });
+    return loadJson<RegState>(id);
+  }
+}
+
+const zeroBits = (h: Uint8Array) => {
+  let n = 0;
+  for (const b of h) { n += Math.clz32(b) - 24; if (b) break; }
+  return n;
+};
+
+/** List a poll you own: sign the entry and mine the proof-of-work (a few seconds). */
+export async function listPoll(instance: string, params: string, title: string) {
+  const { sk } = await identity(); // must be the poll owner (first 32 bytes of params)
+  const ts = Date.now(), msg = `fpl1|${instance}|${params}|${title}|${ts}`;
+  const sig = hex(await ed.signAsync(enc.encode(msg), sk));
+  let nonce = 0;
+  while (zeroBits(sha256(enc.encode(`${msg}|${nonce}`))) < POW_BITS) {
+    if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
+  }
+  await loadRegistry(); // makes sure it exists and caches its full key for the update
+  await sendDelta(await registryId(), { entries: { [instance]: { params, title, ts, nonce, sig } } });
+}
+
+/** Admin only: replace the blocklist (blocked polls disappear from the directory). */
+export async function blockPolls(adminSecretHex: string, list: string[]) {
+  const ts = Date.now();
+  const sig = hex(await ed.signAsync(enc.encode(`fpb1|${ts}|${list.join(",")}`), unhex(adminSecretHex)));
+  await loadRegistry();
+  await sendDelta(await registryId(), { blocked: { ts, list, sig } });
 }

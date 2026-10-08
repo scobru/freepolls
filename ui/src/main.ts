@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  identity, identityFrom, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, watch,
+  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, watch,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -8,11 +8,13 @@ const app = document.getElementById("app")!;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.querySelector(sel) as T;
 
-// route: #/ (builder)  |  #/f/<instanceB58>.<ownerHex>[/i/<inviteSecretHex>] (poll)
+// route: #/ (builder)  |  #/f/<instanceB58>.<paramsHex>[/i/<inviteSecretHex>] (poll)
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
-  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{64})(?:\/i\/([0-9a-f]{64}))?$/);
+  if (location.hash === "#/explore") return explore();
+  if (location.hash === "#/admin") return admin(); // not linked anywhere
+  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})(?:\/i\/([0-9a-f]{64}))?$/);
   return m ? form(m[1], m[2], m[3]) : builder();
 }
 // page URL without the container's ?__sandbox=1 query
@@ -26,10 +28,11 @@ const saveForm = (f: Saved) => { try { localStorage.setItem("fp-polls", JSON.str
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "", inviteOnly = false, nInvites = 10;
+  let title = "", inviteOnly = false, listed = false, nInvites = 10;
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
+      <p><a href="#/explore">Explore public polls &rarr;</a></p>
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -44,11 +47,13 @@ function builder() {
         </section>`).join("")}
       <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Invite only: one personal link = one vote</label>
       ${inviteOnly ? `<label>Number of invites <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
+      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your owner key become discoverable)</label>
       <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
       ${myForms().length ? `<h2>My polls</h2><ul>${myForms().map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : ""}`;
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
-    $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; draw(); };
+    $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; if (inviteOnly) listed = false; draw(); };
+    $<HTMLInputElement>("#ls").onchange = (e) => (listed = (e.target as HTMLInputElement).checked);
     const ni = app.querySelector<HTMLInputElement>("#ni");
     if (ni) ni.oninput = () => (nInvites = Math.min(200, Math.max(1, +ni.value || 1)));
     app.querySelectorAll<HTMLElement>("section.card").forEach((s) => {
@@ -77,9 +82,14 @@ function builder() {
       try {
         const invites = inviteOnly ? await newInvites(nInvites) : [];
         if (invites.length) schema.allowed = invites.map((i) => i.pk);
-        const { instance, owner } = await publish(schema);
-        const hash = `#/f/${instance}.${owner}`;
+        const { instance, params } = await publish(schema);
+        const hash = `#/f/${instance}.${params}`;
         saveForm({ title: schema.title, hash });
+        if (listed && !invites.length) {
+          msg.textContent = "Listing in the public directory (a few seconds of proof-of-work)...";
+          try { await listPoll(instance, params, schema.title.slice(0, 120)); }
+          catch (e) { return void (msg.innerHTML = `Published, but listing failed: ${esc(String(e))}. <a href="${esc(hash)}">Open the poll</a>`); }
+        }
         if (!invites.length) return void (location.hash = hash);
         const secrets = invites.map((i) => i.secret);
         try { localStorage.setItem(`fp-inv:${instance}`, JSON.stringify(secrets)); } catch { /* storage blocked */ }
@@ -88,6 +98,36 @@ function builder() {
     };
   };
   draw();
+}
+
+// ---------------- public directory ----------------
+async function explore() {
+  app.innerHTML = `<p><a href="#/">\u2190 New poll</a></p><h1>Public polls</h1><div id="list">Loading... (the first visit on a node can take up to 30 s)</div>`;
+  try {
+    const rows = Object.entries((await loadRegistry()).entries).sort(([, a], [, b]) => b.ts - a.ts);
+    $("#list").innerHTML = rows.length
+      ? `<ul>${rows.map(([id, e]) => `<li><a href="#/f/${esc(id)}.${esc(e.params)}">${esc(e.title)}</a> <small class="muted">${new Date(e.ts).toLocaleDateString()}</small></li>`).join("")}</ul>`
+      : "<p>No public polls yet.</p>";
+  } catch (e) { $("#list").textContent = `Could not load the directory: ${e}`; }
+}
+
+// admin page: hide polls from the directory with the admin key (hash #/admin)
+async function admin() {
+  app.innerHTML = `
+    <p><a href="#/">\u2190 Back</a></p>
+    <h1>Directory admin</h1>
+    <p class="muted">Admin secret (hex) and the poll ids to hide, one per line. This replaces the whole blocklist.</p>
+    <input id="sk" type="password" autocomplete="off" placeholder="Admin secret" />
+    <textarea id="bl" rows="6"></textarea>
+    <p><button id="go" class="primary" type="button">Publish blocklist</button> <span id="msg"></span></p>`;
+  try { $<HTMLTextAreaElement>("#bl").value = (await loadRegistry()).blocked.list.join("\n"); }
+  catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
+  $("#go").onclick = async () => {
+    const list = $<HTMLTextAreaElement>("#bl").value.split("\n").map((l) => l.trim()).filter(Boolean);
+    $("#msg").textContent = "Sending...";
+    try { await blockPolls($<HTMLInputElement>("#sk").value.trim(), list); $("#msg").textContent = `Done: ${list.length} blocked.`; }
+    catch (e) { $("#msg").textContent = `Error: ${e}`; }
+  };
 }
 
 // ---------------- invite links (secrets exist only in the browser that created the poll) ----------------
@@ -108,7 +148,7 @@ function showInvites(hash: string, secrets: string[]) {
 }
 
 // ---------------- form: fill + live results ----------------
-async function form(instance: string, owner: string, invite?: string) {
+async function form(instance: string, params: string, invite?: string) {
   app.innerHTML = "<p>Loading...</p>";
   const me = invite ? await identityFrom(invite) : await identity();
   let st: FormState, schema: Schema;
@@ -118,7 +158,7 @@ async function form(instance: string, owner: string, invite?: string) {
     void watch(instance).catch(console.warn); // subscribe() may not resolve in local mode; don't block on it
   } catch (e) { return void (app.innerHTML = `<p class="err">Could not load the poll: ${esc(String(e))}</p>`); }
 
-  const link = pageUrl(`#/f/${instance}.${owner}`);
+  const link = pageUrl(`#/f/${instance}.${params}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
   let savedInvites: string[] = [];
   try { savedInvites = JSON.parse(localStorage.getItem(`fp-inv:${instance}`) ?? "[]"); } catch { /* storage blocked */ }
@@ -126,11 +166,11 @@ async function form(instance: string, owner: string, invite?: string) {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
     const n = Object.keys(st.responses).length;
-    const own = me.pk === owner;
+    const own = me.pk === params.slice(0, 64);
     const intro = !schema.allowed
       ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>`
       : `<p class="muted">${own ? `You are the owner. Invite-only poll: ${schema.allowed.length} invites.` : invited ? "You have a personal invite: keep this link to change your answer later." : "Invite-only poll: you need your personal link to answer."}</p>` +
-        (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${owner}`, savedInvites).join("\n"))}</textarea></details>` : "");
+        (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${params}`, savedInvites).join("\n"))}</textarea></details>` : "");
     app.innerHTML = `
       <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
@@ -167,7 +207,7 @@ async function form(instance: string, owner: string, invite?: string) {
         if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Missing: ${q.text}`);
       }
       $("#msg").textContent = "Sending...";
-      try { await sendResponse(instance, me.pk, await signAnswers(me.sk, owner, me.pk, a)); await refresh(); }
+      try { await sendResponse(instance, me.pk, await signAnswers(me.sk, params, me.pk, a)); await refresh(); }
       catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "The node did not accept the answer (invite-only poll: you need your personal link)." : `Errore: ${err}`; }
     };
   };
