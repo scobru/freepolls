@@ -170,7 +170,8 @@ async function form(instance: string, params: string, invite?: string) {
     const n = Object.keys(st.responses).length;
     const own = me.pk === params.slice(0, 64);
     const intro = !schema.allowed
-      ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>`
+      ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>` +
+        (own ? `<p><button id="list-btn" type="button">List in the public directory</button> <span id="list-msg" class="muted">Public and permanent: anyone can see the title.</span></p>` : "")
       : `<p class="muted">${own ? `You are the owner. Invite-only poll: ${schema.allowed.length} invites.` : invited ? "You have a personal invite: keep this link to change your answer later." : "Invite-only poll: you need your personal link to answer."}</p>` +
         (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${params}`, savedInvites).join("\n"))}</textarea></details>` : "");
     app.innerHTML = `
@@ -198,6 +199,14 @@ async function form(instance: string, params: string, invite?: string) {
       </form>
       <h2>Results (${n} ${n === 1 ? "response" : "responses"})</h2>
       ${results()}`;
+    const listBtn = app.querySelector<HTMLButtonElement>("#list-btn");
+    if (listBtn) listBtn.onclick = async () => {
+      const m = $("#list-msg");
+      listBtn.disabled = true;
+      m.textContent = "Mining the proof of work (a few seconds)...";
+      try { await listPoll(instance, params, schema.title.slice(0, 120)); m.textContent = "Listed: it now shows under Explore."; }
+      catch (err) { m.textContent = `Listing failed: ${err}`; listBtn.disabled = false; }
+    };
     $<HTMLFormElement>("#f").onsubmit = async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target as HTMLFormElement), a: Answers = {};

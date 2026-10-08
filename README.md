@@ -82,7 +82,7 @@ Inside the Freenet web container the page is sandboxed without storage, so a key
 
 Polls can opt in to a shared directory, shown on the **Explore** page. It is a second contract (`registry/`), one instance per admin key (the admin public key is its parameter).
 
-- **Listing.** In the builder, tick "List in the public directory" (off by default, never available for invite-only polls). The UI signs an entry `fpl1|<instance>|<params>|<title>|<ts>` with the owner key and attaches a proof-of-work nonce.
+- **Listing.** In the builder, tick "List in the public directory" (off by default, never available for invite-only polls). The owner of an open poll can also list it later with the button on the poll page. The UI signs an entry `fpl1|<instance>|<params>|<title>|<ts>` with the owner key and attaches a proof-of-work nonce.
 - **Proof-of-work.** `sha256("<message>|<nonce>")` must start with 18 zero bits (about 260k hashes, a few seconds in the browser). It makes bulk spam costly, but a determined flooder can still push older polls out.
 - **Size.** The newest 500 entries are kept (deterministic pruning, so merge order does not matter). Titles are limited to 120 characters.
 - **Moderation.** The admin key can publish a signed blocklist (`fpb1|<ts>|<ids>`); blocked polls vanish from the directory and cannot be re-added. The admin page is at `#/admin` (not linked anywhere): paste the admin secret and the ids to hide. Entries are not checked against the polls themselves, so an entry can point to a poll that does not exist.
