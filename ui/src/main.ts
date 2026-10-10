@@ -13,7 +13,8 @@ const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.q
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
-  if (new URLSearchParams(location.search).has("whoiam")) return signInCallback(new URLSearchParams(location.search));
+  const searchParams = new URLSearchParams(location.search);
+  if (searchParams.has("viso") || searchParams.has("whoiam")) return signInCallback(searchParams);
   if (location.hash === "#/explore") return explore();
   if (location.hash === "#/admin") return admin(); // not linked anywhere
   const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/i\/([0-9a-f]{64}))?$/);
@@ -36,9 +37,9 @@ function builder() {
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
       <p><a href="#/explore">Explore public polls &rarr;</a></p>
       ${me === undefined ? `<p class="muted">Checking your sign-in…</p>`
-        : me ? `<p class="muted">Publishing as the whoiam persona <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>`
-        : `<div class="card"><p>Polls belong to your <b>whoiam</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
-           <p><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with whoiam</button> <span id="wmsg" class="muted"></span></p></div>`}
+        : me ? `<p class="muted">Publishing as the Viso persona <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>`
+        : `<div class="card"><p>Polls belong to your <b>Viso</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
+           <p><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p></div>`}
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -53,7 +54,7 @@ function builder() {
         </section>`).join("")}
       <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Invite only: one personal link = one vote</label>
       ${inviteOnly ? `<label>Number of invites <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
-      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your whoiam persona become discoverable)</label>
+      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your Viso persona become discoverable)</label>
       <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
       <div id="mine"></div>`;
@@ -116,15 +117,15 @@ function builder() {
   void session().catch(() => null).then((s) => { me = s; draw(); });
 }
 
-// ---------------- whoiam sign-in ----------------
+// ---------------- Viso sign-in ----------------
 // Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
 const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
 
-/** whoiam sent the user back here with its proof (or a refusal). */
+/** Viso sent the user back here with its proof (or a refusal). */
 async function signInCallback(q: URLSearchParams) {
   app.innerHTML = "<p>Checking the proof…</p>";
   let html: string;
-  try { html = `<p>Signed in as the whoiam persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
+  try { html = `<p>Signed in as the Viso persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
   catch (e) { html = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
   history.replaceState(null, "", `${location.pathname}#/`); // drop the one-time query
   app.innerHTML = `${html}<p><a href="#/">Back to FreePolls</a></p>`;
@@ -210,7 +211,7 @@ async function form(instance: string, params: string, invite?: string) {
     app.innerHTML = `
       <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
-      ${params.length > 96 ? `<p class="muted">by the whoiam persona <code>${esc(personaName(params.slice(0, 64)))}</code></p>` : ""}
+      ${params.length > 96 ? `<p class="muted">by the Viso persona <code>${esc(personaName(params.slice(0, 64)))}</code></p>` : ""}
       ${intro}
       ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
       <form id="f" ${invited ? "" : "hidden"}>
