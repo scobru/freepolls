@@ -1,6 +1,7 @@
 import "./style.css";
 import {
-  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, onRemoteChange, publish, sendResponse, signAnswers, storeGet, storePut, voteProof, watch,
+  APP_PATH_HEX, blockPolls, finishSignIn, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialWhoiam, onRemoteChange,
+  personaName, publish, sendResponse, session, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -12,9 +13,10 @@ const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.q
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
+  if (new URLSearchParams(location.search).has("whoiam")) return signInCallback(new URLSearchParams(location.search));
   if (location.hash === "#/explore") return explore();
   if (location.hash === "#/admin") return admin(); // not linked anywhere
-  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})(?:\/i\/([0-9a-f]{64}))?$/);
+  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/i\/([0-9a-f]{64}))?$/);
   return m ? form(m[1], m[2], m[3]) : builder();
 }
 // page URL without the container's ?__sandbox=1 query
@@ -28,11 +30,15 @@ const saveForm = async (f: Saved) => storePut("polls", JSON.stringify([f, ...(aw
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [];
+  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [], me: Session | null | undefined;
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
       <p><a href="#/explore">Explore public polls &rarr;</a></p>
+      ${me === undefined ? `<p class="muted">Checking your sign-in…</p>`
+        : me ? `<p class="muted">Publishing as the whoiam persona <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>`
+        : `<div class="card"><p>Polls belong to your <b>whoiam</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
+           <p><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with whoiam</button> <span id="wmsg" class="muted"></span></p></div>`}
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -47,10 +53,17 @@ function builder() {
         </section>`).join("")}
       <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Invite only: one personal link = one vote</label>
       ${inviteOnly ? `<label>Number of invites <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
-      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your owner key become discoverable)</label>
+      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your whoiam persona become discoverable)</label>
       <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
       <div id="mine"></div>`;
+    const so = app.querySelector<HTMLButtonElement>("#so");
+    if (so) so.onclick = async () => { await signOut(); me = null; draw(); };
+    const wgo = app.querySelector<HTMLButtonElement>("#wgo");
+    if (wgo) wgo.onclick = async () => {
+      try { $("#wmsg").textContent = "Opening whoiam…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
+      catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
+    };
     $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : "";
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
     $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; if (inviteOnly) listed = false; draw(); };
@@ -100,13 +113,29 @@ function builder() {
   };
   draw();
   void myForms().then((m) => { if (m.length) { mine = m; draw(); } });
+  void session().catch(() => null).then((s) => { me = s; draw(); });
+}
+
+// ---------------- whoiam sign-in ----------------
+// Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
+const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
+
+/** whoiam sent the user back here with its proof (or a refusal). */
+async function signInCallback(q: URLSearchParams) {
+  app.innerHTML = "<p>Checking the proof…</p>";
+  let html: string;
+  try { html = `<p>Signed in as the whoiam persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
+  catch (e) { html = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
+  history.replaceState(null, "", `${location.pathname}#/`); // drop the one-time query
+  app.innerHTML = `${html}<p><a href="#/">Back to FreePolls</a></p>`;
 }
 
 // ---------------- public directory ----------------
 async function explore() {
   app.innerHTML = `<p><a href="#/">\u2190 New poll</a></p><h1>Public polls</h1><div id="list">Loading... (the first visit on a node can take up to 30 s)</div>`;
   try {
-    const rows = Object.entries((await loadRegistry()).entries).sort(([, a], [, b]) => b.ts - a.ts);
+    // only polls of this app: an entry is checked against the app path in its own parameters
+    const rows = Object.entries((await loadRegistry()).entries).filter(([, e]) => e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     $("#list").innerHTML = rows.length
       ? `<ul>${rows.map(([id, e]) => `<li><a href="#/f/${esc(id)}.${esc(e.params)}">${esc(e.title)}</a> <small class="muted">${new Date(e.ts).toLocaleDateString()}</small></li>`).join("")}</ul>`
       : "<p>No public polls yet.</p>";
@@ -163,13 +192,15 @@ async function form(instance: string, params: string, invite?: string) {
   const link = pageUrl(`#/f/${instance}.${params}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
   const ante = await needsAnte(instance, params, schema);
+  // owner = the whoiam persona in the parameters (polls from before personas carry no app path and no owner tools)
+  const owner = params.length > 96 ? (await session().catch(() => null))?.persona === params.slice(0, 64) : false;
   let savedInvites: string[] = [];
   try { savedInvites = JSON.parse((await storeGet(`inv:${instance}`)) ?? "[]"); } catch { /* unreadable: no saved invites */ }
   const draw = () => {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
     const n = Object.keys(st.responses).length;
-    const own = me.pk === params.slice(0, 64);
+    const own = owner;
     const intro = !schema.allowed
       ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>` +
         (ante ? `<p class="muted">Against spam, your first answer asks your Freenet node for a few seconds of proof of work (<a href="https://github.com/soudasuwa/ante" target="_blank" rel="noopener noreferrer">ante</a>). Changing it later needs none.</p>` : "") +
@@ -179,6 +210,7 @@ async function form(instance: string, params: string, invite?: string) {
     app.innerHTML = `
       <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
+      ${params.length > 96 ? `<p class="muted">by the whoiam persona <code>${esc(personaName(params.slice(0, 64)))}</code></p>` : ""}
       ${intro}
       ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
       <form id="f" ${invited ? "" : "hidden"}>

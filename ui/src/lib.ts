@@ -17,6 +17,8 @@ import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
 import anteWasmUrl from "./ante-delegate.wasm?url";
 import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante";
+import { verifyProof } from "./whoiam";
+export { personaName } from "./whoiam";
 import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
 
 // ---- types mirroring contract/src/lib.rs ----
@@ -24,7 +26,8 @@ export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 =
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
 export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
 export interface Response { ts: number; answers_json: string; sig: string; ante?: string } // ante: open polls, hex CBOR proof
-export interface FormState { schema_json: string; schema_sig: string; responses: Record<string, Response> }
+export interface Cert { base: string; challenge: string; ts: number; sig: string } // a whoiam delegation, see below
+export interface FormState { schema_json: string; schema_sig: string; schema_cert?: Cert; responses: Record<string, Response> }
 export type Answers = Record<string, number | number[] | string>;
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
@@ -305,12 +308,79 @@ async function putContract(wasm: string, params: Uint8Array, state: object) {
   return key.encode();
 }
 
-/** Publish a new poll. Parameters = owner pubkey || random salt, so one owner can run many polls. */
+// ---- owner identity: a whoiam persona, through a delegated app key ----
+// whoiam signs `wd1.<app key>.<nonce>` for this app's address: "this app key may act for me in FreePolls"
+// (whoiam-delegation, in the freenames repo). The persona owns the polls; the app key only signs for it.
+// The app key is NOT the respondent key above: delegations are public, and answers must not be linkable to a persona.
+
+/** The app's own path: delegations and poll parameters are bound to it (in dev, "/"). */
+const APP_PATH = location.pathname;
+export const APP_PATH_HEX = hex(enc.encode(APP_PATH));
+
+const appSecret = async () => {
+  let h = await storeGet("app-sk");
+  if (!h) await storePut("app-sk", (h = hex(ed.utils.randomPrivateKey())));
+  return h;
+};
+
+export interface Session { persona: string; cert: Cert; sign: (msg: string) => Promise<string> }
+
+/** The signed-in persona, if its delegation still holds for this node's app key. */
+export async function session(): Promise<Session | null> {
+  const raw = await storeGet("session");
+  if (!raw) return null;
+  const { persona, cert } = JSON.parse(raw) as { persona: string; cert: Cert };
+  const sk = unhex(await appSecret());
+  if (cert.challenge.split(".")[1] !== hex(await ed.getPublicKeyAsync(sk))) return null; // app key changed: sign in again
+  return { persona, cert, sign: async (m) => hex(await ed.signAsync(enc.encode(m), sk)) };
+}
+
+async function requireSession(): Promise<Session> {
+  const s = await session();
+  if (!s) throw new Error("Sign in with whoiam first.");
+  return s;
+}
+
+export const signOut = () => storePut("session", "");
+
+/** The official whoiam web contract; any other whoiam site on this node can be used instead. */
+export const WHOIAM_KEY = "87upyDfYzYHVY1Ypu9knhGUGRdydz54FHrBB6Bp2VBTg";
+export const officialWhoiam = () => `${location.protocol}//${location.host}/v1/contract/web/${WHOIAM_KEY}/`;
+const LINK_MAX_AGE_MS = 10 * 60 * 1000;
+const linkBase = () => `${location.protocol}//${location.host}${APP_PATH}`; // whoiam binds its proof to it
+
+/** Where to send the user to sign in. Remembers the one-time challenge in the delegate store. */
+export async function startSignIn(whoiamUrl: string): Promise<string> {
+  const u = new URL(whoiamUrl);
+  if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
+    throw new Error("Paste the address of your whoiam site on this node (it starts with the same host as this page).");
+  }
+  const appKey = hex(await ed.getPublicKeyAsync(unhex(await appSecret())));
+  const challenge = `wd1.${appKey}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
+  await storePut("signin-pending", challenge);
+  return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
+}
+
+/** Handle whoiam's callback: check challenge, freshness and signature, then keep the delegation. */
+export async function finishSignIn(q: URLSearchParams): Promise<string> {
+  if (q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
+  const pending = await storeGet("signin-pending");
+  await storePut("signin-pending", ""); // one use: burn it whatever happens next
+  const persona = q.get("pk") ?? "";
+  const cert: Cert = { base: linkBase(), challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), sig: q.get("sig") ?? "" };
+  if (!pending || cert.challenge !== pending) throw new Error("This sign-in is unknown or was already used. Start again.");
+  if (!Number.isFinite(cert.ts) || Math.abs(Date.now() - cert.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
+  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("whoiam's signature does not verify.");
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
+}
+
+/** Publish a new poll. Parameters = owner persona || random salt || app path, so one owner can run many polls. */
 export async function publish(schema: Schema) {
-  const me = await identity();
-  const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
+  const me = await requireSession();
+  const params = me.persona + hex(crypto.getRandomValues(new Uint8Array(16))) + APP_PATH_HEX;
   const schema_json = JSON.stringify(schema);
-  const state: FormState = { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), responses: {} };
+  const state: FormState = { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), schema_cert: me.cert, responses: {} };
   return { instance: await putContract(wasmUrl, unhex(params), state), params };
 }
 
@@ -318,7 +388,7 @@ export async function publish(schema: Schema) {
 // The registry address depends on the admin key (its parameter): changing the key creates a new directory.
 export const REGISTRY_ADMIN = "4f3738821e50c271f498aa23a5a569802a418768c84d2a6bd7f643a2d3359d6c";
 const POW_BITS = 18; // must match the contract (sha256, about 3 s of mining)
-export interface RegEntry { params: string; title: string; ts: number; nonce: number; sig: string }
+export interface RegEntry { params: string; title: string; ts: number; nonce: number; sig: string; cert: Cert }
 export interface RegState { entries: Record<string, RegEntry>; blocked: { ts: number; list: string[]; sig: string } }
 
 let regId: Promise<string> | undefined;
@@ -342,7 +412,7 @@ const zeroBits = (h: Uint8Array) => {
 
 /** List a poll you own: sign the entry and mine the proof-of-work (a few seconds). */
 export async function listPoll(instance: string, params: string, title: string) {
-  const me = await identity(); // must be the poll owner (first 32 bytes of params)
+  const me = await requireSession(); // must be the poll owner (first 32 bytes of params)
   const ts = Date.now(), msg = `fpl1|${instance}|${params}|${title}|${ts}`;
   const sig = await me.sign(msg);
   let nonce = 0;
@@ -350,7 +420,7 @@ export async function listPoll(instance: string, params: string, title: string) 
     if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
   }
   await loadRegistry(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await registryId(), { entries: { [instance]: { params, title, ts, nonce, sig } } });
+  await sendDelta(await registryId(), { entries: { [instance]: { params, title, ts, nonce, sig, cert: me.cert } } });
 }
 
 /** Admin only: replace the blocklist (blocked polls disappear from the directory). */
