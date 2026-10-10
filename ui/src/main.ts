@@ -183,16 +183,16 @@ async function form(instance: string, params: string, invite?: string) {
         ${schema.questions.map((q) => `
           <fieldset><legend>${esc(q.text)}${q.required ? " *" : ""}</legend>
           ${q.kind === "text"
-            ? `<textarea name="${q.id}" maxlength="2000">${esc(String(prev[q.id] ?? ""))}</textarea>`
+            ? `<textarea name="${esc(q.id)}" maxlength="2000">${esc(String(prev[q.id] ?? ""))}</textarea>`
             : q.kind === "avail"
             ? q.options.map((o, i) => {
                 const cur = ((prev[q.id] as number[]) ?? [])[i] ?? 0;
-                return `<label class="slot"><span>${esc(o)}</span><select name="${q.id}">${([[1, "Yes"], [2, "Maybe"], [0, "No"]] as const).map(([v, t]) =>
+                return `<label class="slot"><span>${esc(o)}</span><select name="${esc(q.id)}">${([[1, "Yes"], [2, "Maybe"], [0, "No"]] as const).map(([v, t]) =>
                   `<option value="${v}" ${cur === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>`;
               }).join("")
             : q.options.map((o, i) => {
                 const on = q.kind === "multi" ? ((prev[q.id] as number[]) ?? []).includes(i) : prev[q.id] === i;
-                return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${q.id}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
+                return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${esc(q.id)}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
               }).join("")}
           </fieldset>`).join("")}
         <button class="primary">${mine ? "Update answer" : "Submit"}</button> <span id="msg"></span>
@@ -239,7 +239,8 @@ async function form(instance: string, params: string, invite?: string) {
         `<b>${yes[i]} yes${maybe[i] ? ` · ${maybe[i]} maybe` : ""}</b></div>`).join("");
     }
     const counts = q.options.map(() => 0);
-    all.forEach((v) => ([] as number[]).concat(v as number | number[]).forEach((i) => counts[i]++));
+    // a set: the contract accepts [0,0,0], which must still count as one vote
+    all.forEach((v) => new Set(([] as number[]).concat(v as number | number[])).forEach((i) => counts[i]++));
     const max = Math.max(1, ...counts);
     return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
       `<div class="bar"><span>${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${counts[i]}</b></div>`).join("");
