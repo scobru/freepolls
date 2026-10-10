@@ -13,6 +13,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", default-features = false }
 hex = "0.4"
+# ante: proof-of-work commitments signed by the node-held ante delegate (same rev as FreeTunes)
+ante-core = { git = "https://github.com/soudasuwa/ante", rev = "80c0673cbfb58a3bde413274787959a0b502901b", default-features = false }
 
 [features]
 default = ["freenet-main-contract"]

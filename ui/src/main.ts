@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, sendResponse, signAnswers, storeGet, storePut, watch,
+  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, onRemoteChange, publish, sendResponse, signAnswers, storeGet, storePut, voteProof, watch,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -162,6 +162,7 @@ async function form(instance: string, params: string, invite?: string) {
 
   const link = pageUrl(`#/f/${instance}.${params}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
+  const ante = await needsAnte(instance, params, schema);
   let savedInvites: string[] = [];
   try { savedInvites = JSON.parse((await storeGet(`inv:${instance}`)) ?? "[]"); } catch { /* unreadable: no saved invites */ }
   const draw = () => {
@@ -171,6 +172,7 @@ async function form(instance: string, params: string, invite?: string) {
     const own = me.pk === params.slice(0, 64);
     const intro = !schema.allowed
       ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>` +
+        (ante ? `<p class="muted">Against spam, your first answer asks your Freenet node for a few seconds of proof of work (<a href="https://github.com/soudasuwa/ante" target="_blank" rel="noopener noreferrer">ante</a>). Changing it later needs none.</p>` : "") +
         (own ? `<p><button id="list-btn" type="button">List in the public directory</button> <span id="list-msg" class="muted">Public and permanent: anyone can see the title.</span></p>` : "")
       : `<p class="muted">${own ? `You are the owner. Invite-only poll: ${schema.allowed.length} invites.` : invited ? "You have a personal invite: keep this link to change your answer later." : "Invite-only poll: you need your personal link to answer."}</p>` +
         (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${params}`, savedInvites).join("\n"))}</textarea></details>` : "");
@@ -217,8 +219,14 @@ async function form(instance: string, params: string, invite?: string) {
         else if (v.length) a[q.id] = +v[0];
         if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Missing: ${q.text}`);
       }
-      $("#msg").textContent = "Sending...";
-      try { await sendResponse(instance, me.pk, await signAnswers(me, params, a)); await refresh(); }
+      const say = (t: string) => ($("#msg").textContent = t);
+      try {
+        const r = await signAnswers(me, params, a);
+        if (ante) r.ante = st.responses[me.pk]?.ante || (await voteProof(params, me.pk, say));
+        say("Sending...");
+        await sendResponse(instance, me.pk, r);
+        await refresh();
+      }
       catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "The node did not accept the answer (invite-only poll: you need your personal link)." : `Errore: ${err}`; }
     };
   };
