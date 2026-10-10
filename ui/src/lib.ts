@@ -15,12 +15,15 @@ import {
 import wasmUrl from "./contract.wasm?url";
 import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
+import anteWasmUrl from "./ante-delegate.wasm?url";
+import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante";
+import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
 
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
 export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
-export interface Response { ts: number; answers_json: string; sig: string }
+export interface Response { ts: number; answers_json: string; sig: string; ante?: string } // ante: open polls, hex CBOR proof
 export interface FormState { schema_json: string; schema_sig: string; responses: Record<string, Response> }
 export type Answers = Record<string, number | number[] | string>;
 
@@ -61,7 +64,7 @@ async function retrying<T>(f: () => Promise<T>, tries = 3): Promise<T> {
 // Every delegate request, registration included, is answered by one DelegateResponse and the replies carry
 // no request id: calls go one at a time and are matched by order.
 let delegateChain: Promise<unknown> = Promise.resolve();
-function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
+function sendDelegate(req: DelegateRequest, timeoutMs = 8000): Promise<DelegateResponse> {
   const run = async () => {
     let waiter!: Waiter;
     const reply = new Promise<DelegateResponse>((resolve, reject) => {
@@ -70,7 +73,7 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
       setTimeout(() => {
         const i = delegateWaiters.indexOf(waiter);
         if (i >= 0) { delegateWaiters.splice(i, 1); reject(new Error("delegate timeout")); }
-      }, 8000);
+      }, timeoutMs);
     });
     // the SDK has no delegate method yet: use its low-level sender
     const a = (await api()) as unknown as { sendRequest(r: ClientRequestT): void };
@@ -82,26 +85,38 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
   return p;
 }
 
-async function registerDelegate() {
-  const code = new Uint8Array(await (await fetch(identityWasmUrl)).arrayBuffer());
+/** Hand a delegate's wasm to the node (idempotent) and return its key: blake3(blake3(wasm)) for empty parameters. */
+async function registerWasmDelegate(url: string, expectHash?: string): Promise<DelegateKeyT> {
+  const code = new Uint8Array(await (await fetch(url)).arrayBuffer());
   const codeHash = blake3(code);
-  delegateKey = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash)); // empty params: blake3(codeHash)
-  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), delegateKey);
+  if (expectHash && hex(codeHash) !== expectHash) throw new Error("unexpected delegate code");
+  const key = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash));
+  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), key);
   const container = new DelegateContainerT(DelegateType.WasmDelegateV1, wasm);
   // the node ignores cipher and nonce since freenet-core PR #4146 (secrets use a node-side key) but still checks their sizes
   await sendDelegate(new DelegateRequest(DelegateRequestType.RegisterDelegate, new RegisterDelegateT(container, new Array(32).fill(0), new Array(24).fill(0))));
+  return key;
+}
+
+/** One application message to a registered delegate; resolves with the payload of its reply. */
+async function messageDelegate(key: DelegateKeyT, payload: Uint8Array, timeoutMs?: number): Promise<Uint8Array> {
+  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(Array.from(payload), [], false));
+  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(key, [], [msg])), timeoutMs);
+  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
+  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
+  if (!m) throw new Error("empty delegate reply");
+  return new Uint8Array(m.payload);
+}
+
+async function registerDelegate() {
+  delegateKey = await registerWasmDelegate(identityWasmUrl);
 }
 
 // every delegate operation is safe to repeat (init keeps the first key, the rest are reads, signatures and overwrites)
 const callDelegate = (payload: object) => retrying(() => callDelegateOnce(payload));
 
 async function callDelegateOnce(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
-  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(bytes(JSON.stringify(payload)), [], false));
-  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(delegateKey, [], [msg])));
-  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
-  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
-  if (!m) throw new Error("empty delegate reply");
-  const out = JSON.parse(new TextDecoder().decode(new Uint8Array(m.payload)));
+  const out = JSON.parse(new TextDecoder().decode(await messageDelegate(delegateKey!, enc.encode(JSON.stringify(payload)))));
   if (out.err) throw new Error(out.err);
   return out;
 }
@@ -177,6 +192,43 @@ export async function signAnswers(who: Identity, params: string, answers: Answer
   const ts = Date.now(), answers_json = JSON.stringify(answers);
   return { ts, answers_json, sig: await who.sign(`fpr1|${params}|${who.pk}|${ts}|${answers_json}`) };
 }
+
+// ---- open-poll anti-spam: ante (github.com/soudasuwa/ante), as in FreeTunes reports ----
+// The respondent's node asks for consent, the page grinds a few seconds of proof of work, the node signs it. The proof
+// is bound to the poll and the respondent key, so it is made once and reused when the answer changes.
+const CONSENT_MS = 75_000; // the node keeps the consent prompt open for 60 s
+let anteKey: Promise<DelegateKeyT> | undefined;
+async function anteCall(req: CborValue, timeoutMs?: number) {
+  const key = await (anteKey ??= registerWasmDelegate(anteWasmUrl, ANTE_CODE_HASH).catch((e) => { anteKey = undefined; throw e; }));
+  const out = enumVariant(cborDecode(await messageDelegate(key, cborEncode(req), timeoutMs)));
+  if (out.variant === "Error") throw new Error(`ante: ${String(mapGet(out.fields!, "message"))}`);
+  return out;
+}
+
+export class VoteDeclined extends Error { constructor() { super("You declined the proof of work, so the answer was not sent."); } }
+
+/** The ante proof (hex) for answering poll `params` as `pk`. `step` narrates what is happening. */
+export async function voteProof(params: string, pk: string, step: (msg: string) => void = () => {}): Promise<string> {
+  const purpose = votePurpose(params, pk);
+  step("Opening your ante identity…");
+  const vk = asBytes(mapGet((await anteCall("GetIdentity")).fields!, "verifying_key"));
+  step("Your Freenet node asks you to allow a few seconds of anti-spam work. Approve it there…");
+  const grant = await anteCall({ RequestGrind: { purpose, min_bits: VOTE_BITS } }, CONSENT_MS);
+  if (grant.variant === "Denied") throw new VoteDeclined();
+  const challenge = asBytes(mapGet(grant.fields!, "bytes"));
+  if (hex(challenge) !== hex(challengeBytes(purpose, vk))) throw new Error("ante returned an unexpected challenge");
+  const nonce = await grind(challenge, VOTE_BITS, (n) => step(`Working… ${n.toLocaleString()} tries`));
+  step("Signing…");
+  const signed = await anteCall({ Commit: { purpose, nonce, min_bits: VOTE_BITS, ts: Date.now() } }, CONSENT_MS);
+  if (signed.variant === "Denied") throw new VoteDeclined();
+  const proof = asBytes(mapGet(signed.fields!, "proof"));
+  await checkProof(proof, purpose); // catch a bad proof here: the node would only answer "Request timeout"
+  return hex(proof);
+}
+
+/** Polls published by this contract version check ante on open polls; older ones were published without it. */
+export const needsAnte = async (instance: string, params: string, schema: Schema) =>
+  !schema.allowed && (await build(wasmUrl, unhex(params))).key.encode() === instance;
 
 // ---- node connection ----
 type Listener = () => void;

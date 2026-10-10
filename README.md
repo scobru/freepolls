@@ -40,7 +40,17 @@ At creation the UI generates one ed25519 keypair per invite: the public key goes
 - The invite secrets exist only in the browser that created the poll. They are shown once after publishing and, where `localStorage` is available, kept so the owner can see them again. They cannot be recomputed.
 - The number of invites is fixed when the poll is created.
 - Anyone holding a personal link can vote as that invite, so share each link with one person only.
-- Open polls (no `allowed`) behave as before: one response per key, and keys are free to create.
+- Open polls (no `allowed`) take one response per key, and each respondent must carry an ante proof of work (below).
+
+### Open polls and ante
+
+Keys are free to create, so an open poll asks each respondent for a proof of work from [ante](https://github.com/soudasuwa/ante), as FreeTunes does for reports. The response carries `ante`: the hex CBOR `AnteProof` signed by the respondent's *ante identity*, which lives in the ante delegate on their own node (`ui/src/ante-delegate.wasm`, pinned by blake3 `f10f40a3...925f`).
+
+- Purpose `freepolls:vote:v1:<params_hex>:<respondent_hex>`, at least 18 bits of work (a few seconds in the browser). The node asks the respondent's consent before any work is spent.
+- The proof is bound to the poll and the respondent key, not the answers, so changing an answer reuses it.
+- One respondent per ante identity. If two respondent keys carry the same ante identity, the smaller key is kept, so every merge order converges.
+- It raises the cost of each fake respondent; it does not prove one person = one vote: someone willing to grind can still answer many times with many ante identities.
+- Polls published before this contract version have no ante check; the UI only asks for the work where the poll's address matches the current contract.
 
 Answer values by question kind: `single` = option index, `multi` = list of option indexes, `text` = string, `avail` = one value per option (slot) in order, `0` = no, `1` = yes, `2` = maybe. The best availability slot is the one with most "yes", ties broken by "maybe".
 
@@ -58,7 +68,8 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 ### Contract rules (`contract/src/lib.rs`)
 
 - `validate_state`: schema signature valid; every response signature valid; every answer matches the schema (known question ids, option indexes in range, `avail` length equal to the number of slots, required questions answered, text up to 2000 bytes).
-- `update_state`: the schema is set once. Responses merge **per respondent, last write wins by `ts`**. Older or equal `ts` is ignored. Anything invalid rejects the update.
+- `validate_state`: open polls also need a valid ante proof per respondent and no ante identity used twice.
+- `update_state`: the schema is set once. Responses merge **per respondent, last write wins by `ts`**. Older or equal `ts` is ignored. For open polls, a respondent whose ante identity is already held by a smaller key is ignored, and one held by a larger key is replaced. Anything invalid rejects the update.
 - `summarize_state` / `get_state_delta`: summary = `{ has_schema, responses: pubkey -> ts }`; delta = the schema if the peer lacks it, plus responses newer than the peer's summary. An empty summary or empty state means "nothing known yet" (the node sends one on subscribe).
 
 ### UI (`ui/src/`)
@@ -98,6 +109,7 @@ Requirements: `rustup` with the `wasm32-unknown-unknown` target, `freenet` and `
 ```bash
 # contract: test, build, copy the wasm into the UI
 cargo test
+(cd ui && npm test)   # the ante proof as the UI builds it
 cargo build --release --target wasm32-unknown-unknown -p freepolls-contract -p freepolls-registry -p freepolls-identity
 cp target/wasm32-unknown-unknown/release/freepolls_contract.wasm ui/src/contract.wasm
 cp target/wasm32-unknown-unknown/release/freepolls_registry.wasm ui/src/registry.wasm
@@ -142,7 +154,7 @@ fdev website update dist --key freepolls
 ## Limitations
 
 - **Answers are public.** Anyone with the poll link can read the state. Do not collect personal or sensitive data: Freenet has no global delete, so published polls and answers cannot be withdrawn.
-- **Open polls: one response per key, not per person.** Anyone can generate more keys. Use an invite-only poll when the vote count matters.
+- **Open polls: one response per ante identity, not per person.** Each extra identity costs a few seconds of work, which slows spam but does not stop a determined grinder. Use an invite-only poll when the vote count matters.
 - Changing the contract changes its code hash: polls already published keep running the old contract.
 - `subscribe()` does not resolve in local mode, so the UI does not wait for it.
 - No way to close a poll yet.
@@ -155,7 +167,7 @@ fdev website update dist --key freepolls
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.
 - Directory: re-check entries against the polls themselves, search, pagination.
-- Optional anti-spam stamps for open polls ([ante](https://github.com/soudasuwa/ante) proof-of-work or [Ghost Keys](https://freenet.org/ghostkey/)). Both only raise the cost of fake identities; neither proves one person = one vote.
+- [Ghost Keys](https://freenet.org/ghostkey/) as a stronger alternative to ante for open polls.
 - Re-issue or add invites after creation.
 
 ## License
