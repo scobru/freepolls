@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockPolls, finishSignIn, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialWhoiam, onRemoteChange,
+  APP_PATH_HEX, blockPolls, finishSignIn, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
   personaName, publish, sendResponse, session, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
@@ -39,7 +39,7 @@ function builder() {
       ${me === undefined ? `<p class="muted">Checking your sign-in…</p>`
         : me ? `<p class="muted">Publishing as the Viso persona <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>`
         : `<div class="card"><p>Polls belong to your <b>Viso</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
-           <p><input id="wurl" value="${esc(officialWhoiam())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p></div>`}
+           <p><input id="wurl" value="${esc(officialViso())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p></div>`}
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -62,7 +62,7 @@ function builder() {
     if (so) so.onclick = async () => { await signOut(); me = null; draw(); };
     const wgo = app.querySelector<HTMLButtonElement>("#wgo");
     if (wgo) wgo.onclick = async () => {
-      try { $("#wmsg").textContent = "Opening whoiam…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
+      try { $("#wmsg").textContent = "Opening Viso…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
       catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
     };
     $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : "";
