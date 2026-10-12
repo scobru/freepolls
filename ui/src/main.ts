@@ -89,7 +89,13 @@ function builder() {
       try { $("#wmsg").textContent = "Opening Viso…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
       catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
     };
-    $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : "";
+    $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f, i) =>
+      `<li><a href="${esc(f.hash)}">${esc(f.title)}</a> <button class="forget" type="button" data-i="${i}" title="Remove from this list (the poll stays online)" aria-label="Remove ${esc(f.title)} from my polls">&times;</button></li>`).join("")}</ul>` : "";
+    app.querySelectorAll<HTMLButtonElement>(".forget").forEach((b) => (b.onclick = async () => {
+      mine = mine.filter((_, i) => i !== +b.dataset.i!);
+      await storePut("polls", JSON.stringify(mine));
+      draw();
+    }));
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
     $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; if (inviteOnly) listed = false; draw(); };
     $<HTMLInputElement>("#ls").onchange = (e) => (listed = (e.target as HTMLInputElement).checked);
@@ -181,9 +187,20 @@ async function admin() {
     <p class="muted">Admin secret (hex) and the poll ids to hide, one per line. This replaces the whole blocklist.</p>
     <input id="sk" type="password" autocomplete="off" placeholder="Admin secret" />
     <textarea id="bl" rows="6"></textarea>
-    <p><button id="go" class="primary" type="button">Publish blocklist</button> <span id="msg"></span></p>`;
-  try { $<HTMLTextAreaElement>("#bl").value = (await loadRegistry()).blocked.list.join("\n"); }
-  catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
+    <p><button id="go" class="primary" type="button">Publish blocklist</button> <span id="msg"></span></p>
+    <h2>Listed polls</h2><div id="listed" class="muted">Loading…</div>`;
+  try {
+    const reg = await loadRegistry(), bl = $<HTMLTextAreaElement>("#bl");
+    bl.value = reg.blocked.list.join("\n");
+    const rows = Object.entries(reg.entries).sort(([, a], [, b]) => b.ts - a.ts);
+    $("#listed").innerHTML = rows.length ? `<ul>${rows.map(([id, e]) =>
+      `<li>${esc(e.title)} <small class="muted">${new Date(e.ts).toLocaleDateString()} · <code>${esc(id)}</code></small> <button class="hide" type="button" data-id="${esc(id)}">Hide</button></li>`).join("")}</ul>` : "No polls listed.";
+    // adds the id to the blocklist above; nothing is sent until "Publish blocklist"
+    app.querySelectorAll<HTMLButtonElement>(".hide").forEach((b) => (b.onclick = () => {
+      if (!bl.value.split("\n").includes(b.dataset.id!)) bl.value = [bl.value.trim(), b.dataset.id].filter(Boolean).join("\n");
+      b.disabled = true;
+    }));
+  } catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
   $("#go").onclick = async () => {
     const list = $<HTMLTextAreaElement>("#bl").value.split("\n").map((l) => l.trim()).filter(Boolean);
     $("#msg").textContent = "Sending...";
