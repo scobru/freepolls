@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockPolls, finishSignIn, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
+  APP_PATH_HEX, blockPolls, createLocalIdentity, finishSignIn, localIdentityKey, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
   personaName, publish, sendResponse, session, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
@@ -31,15 +31,19 @@ const saveForm = async (f: Saved) => storePut("polls", JSON.stringify([f, ...(aw
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [], me: Session | null | undefined;
+  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [], me: Session | null | undefined, key: string | null = null;
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
       <p><a href="#/explore">Explore public polls &rarr;</a></p>
       ${me === undefined ? `<p class="muted">Checking your sign-in…</p>`
-        : me ? `<p class="muted">Publishing as the Viso persona <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>`
+        : me ? `<p class="muted">Publishing as the ${key ? "identity" : "Viso persona"} <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>
+           ${key ? `<div class="card"><p class="muted">This identity was made here, so its key is the only way to get it back. Keep it secret: whoever has it can publish as you.</p>
+           <p><button id="kshow" type="button">Show key</button> <button id="kdl" type="button">Download key</button></p><p><code id="kval" hidden>${esc(key)}</code></p></div>` : ""}`
         : `<div class="card"><p>Polls belong to your <b>Viso</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
-           <p><input id="wurl" value="${esc(officialViso())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p></div>`}
+           <p><input id="wurl" value="${esc(officialViso())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p>
+           <p class="muted">Or create an identity here, no Viso needed: FreePolls makes a new key on this node. You get a key to back up, and pasting it here (in this or another Freenet app, on any node) brings the same identity back.</p>
+           <p><button id="lnew" type="button">Create identity</button> <input id="lkey" type="password" placeholder="Already have a key? Paste it" spellcheck="false" autocomplete="off" /> <button id="limport" type="button">Use this key</button> <span id="lmsg" class="muted"></span></p></div>`}
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -59,7 +63,27 @@ function builder() {
       <p id="msg"></p>
       <div id="mine"></div>`;
     const so = app.querySelector<HTMLButtonElement>("#so");
-    if (so) so.onclick = async () => { await signOut(); me = null; draw(); };
+    if (so) so.onclick = async () => {
+      if (key && !confirm("Signing out deletes the key from this node. Without your backup this identity is lost. Sign out?")) return;
+      await signOut(); me = null; key = null; draw();
+    };
+    const kshow = app.querySelector<HTMLButtonElement>("#kshow");
+    if (kshow) kshow.onclick = () => { $("#kval").hidden = !$("#kval").hidden; };
+    const kdl = app.querySelector<HTMLButtonElement>("#kdl");
+    if (kdl && key && me) kdl.onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([`FreePolls identity key: keep it secret.\n${key}\n`], { type: "text/plain" }));
+      a.download = `identity-${personaName(me!.persona).slice(0, 8)}.txt`;
+      a.click();
+    };
+    const local = async (k?: string) => {
+      try { await createLocalIdentity(k); [me, key] = [await session(), await localIdentityKey()]; draw(); }
+      catch (e) { $("#lmsg").textContent = String((e as Error).message ?? e); }
+    };
+    const lnew = app.querySelector<HTMLButtonElement>("#lnew");
+    if (lnew) lnew.onclick = () => local();
+    const limport = app.querySelector<HTMLButtonElement>("#limport");
+    if (limport) limport.onclick = () => local($<HTMLInputElement>("#lkey").value);
     const wgo = app.querySelector<HTMLButtonElement>("#wgo");
     if (wgo) wgo.onclick = async () => {
       try { $("#wmsg").textContent = "Opening Viso…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
@@ -114,7 +138,13 @@ function builder() {
   };
   draw();
   void myForms().then((m) => { if (m.length) { mine = m; draw(); } });
-  void session().catch(() => null).then((s) => { me = s; draw(); });
+  const loadMe = async () => {
+    let s = await session();
+    key = await localIdentityKey();
+    if (!s && key) { await createLocalIdentity(key); s = await session(); } // made here, but the app key changed: sign again
+    return s;
+  };
+  void loadMe().catch(() => null).then((s) => { me = s; draw(); });
 }
 
 // ---------------- Viso sign-in ----------------

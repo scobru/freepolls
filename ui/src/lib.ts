@@ -17,7 +17,7 @@ import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
 import anteWasmUrl from "./ante-delegate.wasm?url";
 import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante";
-import { verifyProof } from "./whoiam";
+import { connectMessage, verifyProof } from "./whoiam";
 export { personaName } from "./whoiam";
 import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
 
@@ -337,11 +337,12 @@ export async function session(): Promise<Session | null> {
 
 async function requireSession(): Promise<Session> {
   const s = await session();
-  if (!s) throw new Error("Sign in with Viso first.");
+  if (!s) throw new Error("Sign in first.");
   return s;
 }
 
-export const signOut = () => storePut("session", "");
+/** Forget the sign-in, and the persona key if it was made here (the user was told to save it first). */
+export const signOut = async () => { await storePut("session", ""); await storePut("persona-key", ""); };
 
 /** The official Viso web contract; any other Viso site on this node can be used instead. */
 export const VISO_KEY = "GzHy3jnEtj26EoGqMsBpoawcY378hK9kp91rTcNYiAac";
@@ -376,6 +377,22 @@ export async function finishSignIn(q: URLSearchParams): Promise<string> {
   await storePut("session", JSON.stringify({ persona, cert }));
   return persona;
 }
+
+/** A persona made here instead of in Viso: a new key (or an imported one, hex) signs the same proof Viso would. */
+export async function createLocalIdentity(secretHex?: string): Promise<string> {
+  const sk = secretHex?.replace(/\s/g, "").toLowerCase() || hex(ed.utils.randomPrivateKey());
+  if (!/^[0-9a-f]{64}$/.test(sk)) throw new Error("The key must be 64 hexadecimal characters.");
+  const persona = hex(await ed.getPublicKeyAsync(sk));
+  const appKey = hex(await ed.getPublicKeyAsync(unhex(await appSecret())));
+  const cert: Cert = { base: linkBase(), challenge: `wd1.${appKey}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`, ts: Date.now(), sig: "" };
+  cert.sig = hex(await ed.signAsync(connectMessage(unhex(persona), cert.base, cert.challenge, cert.ts), sk));
+  await storePut("persona-key", sk);
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
+}
+
+/** The secret key of a persona made here (hex), for the user to back up; null for a Viso persona. */
+export const localIdentityKey = async () => (await storeGet("persona-key")) || null;
 
 /** Publish a new poll. Parameters = owner persona || random salt || app path, so one owner can run many polls. */
 export async function publish(schema: Schema) {
