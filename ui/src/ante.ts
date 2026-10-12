@@ -12,8 +12,9 @@ export const VOTE_BITS = 18; // must match MIN_BITS in contract/src/lib.rs
 /** The published ante delegate: blake3 of its wasm. The page refuses to talk to any other code. */
 export const ANTE_CODE_HASH = "f10f40a38f2429f5499f503948001b2fd3a8e2923309ede75c47c9f0ce78925f";
 
-/** What a respondent's proof commits to: the poll and the respondent key, so changing the answer needs no new work. */
-export const votePurpose = (params: string, pk: string) => `freepolls:vote:v1:${params}:${pk}`;
+/** What a respondent's proof commits to: the poll and the respondent key, so changing the answer needs no new work.
+ *  The params are hashed: in full (with the app path) they exceed ante's 256-byte purpose limit. */
+export const votePurpose = (params: string, pk: string) => `freepolls:vote:v2:${ed.etc.bytesToHex(blake3(enc.encode(params)))}:${pk}`;
 
 const u32le = (n: number) => new Uint8Array(new Uint32Array([n]).buffer);
 const u64le = (n: number) => new Uint8Array(new BigUint64Array([BigInt(n)]).buffer);

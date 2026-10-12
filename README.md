@@ -47,7 +47,7 @@ At creation the UI generates one ed25519 keypair per invite: the public key goes
 
 Keys are free to create, so an open poll asks each respondent for a proof of work from [ante](https://github.com/soudasuwa/ante), as FreeTunes does for reports. The response carries `ante`: the hex CBOR `AnteProof` signed by the respondent's *ante identity*, which lives in the ante delegate on their own node (`ui/src/ante-delegate.wasm`, pinned by blake3 `f10f40a3...925f`).
 
-- Purpose `freepolls:vote:v1:<params_hex>:<respondent_hex>`, at least 18 bits of work (a few seconds in the browser). The node asks the respondent's consent before any work is spent.
+- Purpose `freepolls:vote:v2:<blake3(params_hex) hex>:<respondent_hex>` (the full params, app path included, would exceed ante's 256-byte purpose limit), at least 18 bits of work (a few seconds in the browser). The node asks the respondent's consent before any work is spent.
 - The proof is bound to the poll and the respondent key, not the answers, so changing an answer reuses it.
 - One respondent per ante identity. If two respondent keys carry the same ante identity, the smaller key is kept, so every merge order converges.
 - It raises the cost of each fake respondent; it does not prove one person = one vote: someone willing to grind can still answer many times with many ante identities.
