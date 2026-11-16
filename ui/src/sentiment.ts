@@ -24,3 +24,16 @@ export function isCorrect(answers: Answers, outcome: Answers, qid: string): bool
   const norm = (v: Answers[string]) => JSON.stringify([...new Set(([] as number[]).concat(v as number | number[]))].sort());
   return norm(answers[qid]) === norm(outcome[qid]);
 }
+
+/** One SVG `<circle>` ring per option, drawn as a donut chart: stroke-dasharray/dashoffset in length units
+ *  along a circle of circumference `c`, in the same order as `pct`. Pure math only — the caller draws the SVG. */
+export function donutArcs(pct: number[], r: number): { dasharray: string; dashoffset: number }[] {
+  const c = 2 * Math.PI * r;
+  let covered = 0;
+  return pct.map((p) => {
+    const len = (Math.max(0, p) / 100) * c;
+    const arc = { dasharray: `${len} ${c - len}`, dashoffset: -((covered / 100) * c) || 0 };
+    covered += p;
+    return arc;
+  });
+}

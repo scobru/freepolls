@@ -48,6 +48,11 @@ small.muted { font-size: .8em; }
 .bar.best i { background: var(--accent); }
 .bar.correct { font-weight: 600; }
 .bar.correct i { background: #2e7d32; }
+.bar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; font: inherit; }
+.results-row { display: flex; align-items: center; gap: 20px; }
+.results-row .donut { flex: none; }
+.results-row .bars { flex: 1; min-width: 0; }
+@media (max-width: 480px) { .results-row { flex-direction: column; align-items: stretch; } .results-row .donut { align-self: center; } }
 @keyframes grow { from { transform: scaleX(0); } }
 details.resolve { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 10px 0; }
 .slot { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
