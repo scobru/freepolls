@@ -16,10 +16,10 @@ import wasmUrl from "./contract.wasm?url";
 import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
 import anteWasmUrl from "./ante-delegate.wasm?url";
-import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante";
-import { connectMessage, verifyProof } from "./whoiam";
-export { personaName } from "./whoiam";
-import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
+import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante.ts";
+import { connectMessage, verifyProof } from "./whoiam.ts";
+export { personaName } from "./whoiam.ts";
+import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor.ts";
 
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
@@ -27,7 +27,8 @@ export interface Question { id: string; kind: Kind; text: string; options: strin
 export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
 export interface Response { ts: number; answers_json: string; sig: string; ante?: string } // ante: open polls, hex CBOR proof
 export interface Cert { base: string; challenge: string; ts: number; sig: string } // a whoiam delegation, see below
-export interface FormState { schema_json: string; schema_sig: string; schema_cert?: Cert; responses: Record<string, Response> }
+export interface Resolution { outcome_json: string; ts: number; sig: string; cert: Cert } // outcome_json: same shape as a Response's answers_json
+export interface FormState { schema_json: string; schema_sig: string; schema_cert?: Cert; responses: Record<string, Response>; resolution?: Resolution }
 export type Answers = Record<string, number | number[] | string>;
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
@@ -196,6 +197,15 @@ export async function signAnswers(who: Identity, params: string, answers: Answer
   return { ts, answers_json, sig: await who.sign(`fpr1|${params}|${who.pk}|${ts}|${answers_json}`) };
 }
 
+/** Sign the poll's final outcome, owner only (the contract checks the signer is the owner's delegated app key).
+ *  Set once: the contract silently ignores a second resolution, whatever it says. */
+export async function resolve(params: string, outcome: Answers): Promise<Resolution> {
+  const me = await requireSession();
+  const ts = Date.now(), outcome_json = JSON.stringify(outcome);
+  return { outcome_json, ts, sig: await me.sign(`fpz1|${params}|${outcome_json}|${ts}`), cert: me.cert };
+}
+export { shares, isCorrect } from "./sentiment.ts";
+
 // ---- open-poll anti-spam: ante (github.com/soudasuwa/ante), as in FreeTunes reports ----
 // The respondent's node asks for consent, the page grinds a few seconds of proof of work, the node signs it. The proof
 // is bound to the poll and the respondent key, so it is made once and reused when the answer changes.
@@ -292,6 +302,8 @@ async function sendDelta(instance: string, delta: object) {
 }
 export const sendResponse = (instance: string, pk: string, r: Response) =>
   sendDelta(instance, { schema: null, responses: { [pk]: r } });
+export const sendResolution = (instance: string, resolution: Resolution) =>
+  sendDelta(instance, { schema: null, resolution, responses: {} });
 
 /** Contract code + key. Instance id = blake3(blake3(wasm) || params), same as freenet-stdlib. */
 async function build(wasm: string, params: Uint8Array) {

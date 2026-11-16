@@ -46,7 +46,10 @@ small.muted { font-size: .8em; }
 .bar u { background: color-mix(in srgb, var(--fg) 10%, transparent); }
 .bar.best { font-weight: 600; }
 .bar.best i { background: var(--accent); }
+.bar.correct { font-weight: 600; }
+.bar.correct i { background: #2e7d32; }
 @keyframes grow { from { transform: scaleX(0); } }
+details.resolve { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 10px 0; }
 .slot { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .slot select { width: auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 

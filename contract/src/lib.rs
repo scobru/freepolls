@@ -24,6 +24,17 @@ pub struct Response {
     pub ante: String,
 }
 
+/// The poll's final outcome, signed by the owner once: `outcome_json` has the same shape as a response's
+/// `answers_json` (one correct value per resolvable question), checked by `check_answers` against the schema.
+/// Set once and never replaced — a market that could un-resolve or change its mind would be worthless.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Resolution {
+    pub outcome_json: String,
+    pub ts: u64,
+    pub sig: String, // hex, by the owner's delegated app key: "fpz1|{params}|{outcome_json}|{ts}"
+    pub cert: Cert,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct FormState {
     pub schema_json: String,
@@ -31,17 +42,21 @@ pub struct FormState {
     #[serde(default)]
     pub schema_cert: Option<Cert>, // the owner's delegation to that key
     pub responses: BTreeMap<String, Response>, // respondent pubkey hex -> response
+    #[serde(default)]
+    pub resolution: Option<Resolution>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Summary {
     pub has_schema: bool,
+    pub has_resolution: bool,
     pub responses: BTreeMap<String, u64>, // pubkey -> ts
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Delta {
     pub schema: Option<(String, String, Cert)>, // (schema_json, sig, delegation)
+    pub resolution: Option<Resolution>,
     pub responses: BTreeMap<String, Response>,
 }
 
@@ -95,6 +110,15 @@ fn parse_schema(params: &str, schema_json: &str, sig: &str, cert: Option<&Cert>)
         a.iter().try_for_each(|k| key(k).map(|_| ()))?;
     }
     Ok(schema)
+}
+
+/// Checks a resolution's signature and delegation, and that its outcome is a valid answer set for `schema`.
+fn parse_resolution(params: &str, schema: &Schema, res: &Resolution) -> R<()> {
+    let raw = hex::decode(params).map_err(|e| e.to_string())?;
+    let app = std::str::from_utf8(raw.get(48..).ok_or("params too short")?).map_err(|e| e.to_string())?;
+    let app_key = check(&params[..64], app, &res.cert)?;
+    verify(&app_key, format!("fpz1|{params}|{}|{}", res.outcome_json, res.ts).as_bytes(), &res.sig)?;
+    check_answers(schema, &res.outcome_json)
 }
 
 fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
@@ -161,6 +185,9 @@ fn holder<'a>(s: &'a FormState, who: &str, ante: &str) -> Option<&'a String> {
 
 pub fn validate(params: &str, s: &FormState) -> R<()> {
     let schema = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
+    if let Some(res) = &s.resolution {
+        parse_resolution(params, &schema, res)?;
+    }
     let mut seen = std::collections::BTreeSet::new();
     for (who, r) in &s.responses {
         if let Some(a) = check_response(params, &schema, who, r)? {
@@ -172,7 +199,7 @@ pub fn validate(params: &str, s: &FormState) -> R<()> {
     Ok(())
 }
 
-/// Merge a delta into state: schema is set once, per-respondent last-write-wins by ts.
+/// Merge a delta into state: schema and resolution are each set once, per-respondent last-write-wins by ts.
 pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
     if let Some((json, sig, cert)) = d.schema {
         if s.schema_json.is_empty() {
@@ -183,6 +210,12 @@ pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
         }
     }
     let schema = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
+    if let Some(res) = d.resolution {
+        if s.resolution.is_none() {
+            parse_resolution(params, &schema, &res)?;
+            s.resolution = Some(res);
+        }
+    }
     for (who, r) in d.responses {
         if s.responses.get(&who).is_some_and(|old| old.ts >= r.ts) {
             continue;
@@ -204,6 +237,7 @@ pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
 pub fn summarize(s: &FormState) -> Summary {
     Summary {
         has_schema: !s.schema_json.is_empty(),
+        has_resolution: s.resolution.is_some(),
         responses: s.responses.iter().map(|(k, r)| (k.clone(), r.ts)).collect(),
     }
 }
@@ -213,6 +247,7 @@ pub fn delta(s: &FormState, sum: &Summary) -> Delta {
         schema: (!sum.has_schema && !s.schema_json.is_empty())
             .then(|| s.schema_cert.clone().map(|c| (s.schema_json.clone(), s.schema_sig.clone(), c)))
             .flatten(),
+        resolution: (!sum.has_resolution).then(|| s.resolution.clone()).flatten(),
         responses: s
             .responses
             .iter()
@@ -270,6 +305,7 @@ impl ContractInterface for Contract {
                     let other: FormState = de(st.as_ref())?;
                     Delta {
                         schema: other.schema_cert.filter(|_| !other.schema_json.is_empty()).map(|c| (other.schema_json, other.schema_sig, c)),
+                        resolution: other.resolution,
                         responses: other.responses,
                     }
                 }
@@ -319,6 +355,15 @@ mod tests {
     }
     fn schema(o: &SigningKey, params: &str, json: &str) -> (String, String, Cert) {
         schema_for(o, params, json, APP)
+    }
+    /// A resolution signed by the owner, same delegation shape as `schema`.
+    fn resolution(o: &SigningKey, params: &str, outcome: &str, ts: u64) -> Resolution {
+        let app_key = sk(100);
+        let (base, challenge) = (format!("http://127.0.0.1:7509{APP}"), format!("wd1.{}.n1", pk(&app_key)));
+        let csig = o.sign(&connect_message(o.verifying_key().as_bytes(), &base, &challenge, 1));
+        let cert = Cert { base, challenge, ts: 1, sig: hex::encode(csig.to_bytes()) };
+        let sig = hex::encode(app_key.sign(format!("fpz1|{params}|{outcome}|{ts}").as_bytes()).to_bytes());
+        Resolution { outcome_json: outcome.into(), ts, sig, cert }
     }
 
     fn sk(n: u8) -> SigningKey {
@@ -423,7 +468,7 @@ mod tests {
         );
         let mut s = FormState::default();
         let (k, r) = resp(&op, &invited, 1, r#"{"q1":0}"#);
-        apply(&op, &mut s, Delta { schema: Some(self::schema(&o, &op, &schema)), responses: [(k, r)].into() }).unwrap();
+        apply(&op, &mut s, Delta { schema: Some(self::schema(&o, &op, &schema)), responses: [(k, r)].into(), ..Default::default() }).unwrap();
         validate(&op, &s).unwrap();
         let (k2, r2) = resp(&op, &stranger, 1, r#"{"q1":0}"#);
         assert!(apply(&op, &mut s, Delta { responses: [(k2, r2)].into(), ..Default::default() }).is_err());
@@ -489,5 +534,37 @@ mod tests {
         let d = delta(&s, &Summary::default());
         assert!(d.schema.is_some() && d.responses.len() == 1);
         assert!(delta(&s, &summarize(&s)).responses.is_empty());
+    }
+
+    #[test]
+    fn resolution_sets_once_and_is_checked_against_the_schema() {
+        let o = sk(1);
+        let (op, mut s) = open_poll(&o);
+
+        // a bad outcome (out of range) is rejected
+        let bad = resolution(&o, &op, r#"{"q1":9}"#, 10);
+        assert!(apply(&op, &mut s, Delta { resolution: Some(bad), ..Default::default() }).is_err());
+
+        // a valid resolution is accepted and validates
+        let res = resolution(&o, &op, r#"{"q1":1}"#, 10);
+        apply(&op, &mut s, Delta { resolution: Some(res), ..Default::default() }).unwrap();
+        validate(&op, &s).unwrap();
+        assert_eq!(s.resolution.as_ref().unwrap().outcome_json, r#"{"q1":1}"#);
+
+        // once set, a later resolution (even a differently-signed, differently-timed one) never replaces it
+        let other = resolution(&o, &op, r#"{"q1":0}"#, 20);
+        apply(&op, &mut s, Delta { resolution: Some(other), ..Default::default() }).unwrap();
+        assert_eq!(s.resolution.as_ref().unwrap().outcome_json, r#"{"q1":1}"#);
+
+        // someone else's signature over the same poll's params is rejected
+        let (stranger_op, _) = open_poll(&sk(2));
+        let forged = resolution(&sk(2), &stranger_op, r#"{"q1":1}"#, 10);
+        let mut fresh = FormState::default();
+        apply(&op, &mut fresh, Delta { schema: Some(schema(&o, &op, SCHEMA)), ..Default::default() }).unwrap();
+        assert!(apply(&op, &mut fresh, Delta { resolution: Some(forged), ..Default::default() }).is_err());
+
+        // summary/delta round-trip
+        assert!(summarize(&s).has_resolution);
+        assert!(delta(&s, &summarize(&s)).resolution.is_none());
     }
 }

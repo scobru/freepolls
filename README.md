@@ -28,9 +28,24 @@ The UI computes the same id before publishing (same derivation as `freenet-stdli
   "schema_cert": { "base": "<FreePolls address>", "challenge": "wd1.<app key>.<nonce>", "ts": 0, "sig": "<persona's whoiam signature>" },
   "responses": {
     "<respondent pubkey hex>": { "ts": 1791409999000, "answers_json": "{\"q1\":1}", "sig": "<hex>" }
+  },
+  "resolution": {
+    "outcome_json": "{\"q1\":0}",
+    "ts": 1791409999000,
+    "sig": "<hex, same owner delegation as schema_sig>",
+    "cert": { "base": "...", "challenge": "wd1...", "ts": 0, "sig": "..." }
   }
 }
 ```
+
+### Resolving a poll (single/multi questions only)
+
+The owner can mark the poll's final outcome: one correct option per single/multi question, signed the same way
+as the schema (`fpz1|<params>|<outcome_json>|<ts>`, same delegation). It's set once — the contract ignores any
+later resolution attempt, whatever it says, so an outcome can't be walked back or changed. Results then show
+each option's live share of respondents (not just a raw count), mark the correct one, and tell a respondent
+whether their own answer matched. Polls that mix in `text` or `avail` questions have no resolve control: an
+outcome needs an option to be "correct", and those kinds have none.
 
 ### Invite-only polls
 
