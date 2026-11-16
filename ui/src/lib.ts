@@ -15,13 +15,19 @@ import {
 import wasmUrl from "./contract.wasm?url";
 import identityWasmUrl from "./identity.wasm?url";
 import registryWasmUrl from "./registry.wasm?url";
+import anteWasmUrl from "./ante-delegate.wasm?url";
+import { ANTE_CODE_HASH, VOTE_BITS, challengeBytes, checkProof, grind, votePurpose } from "./ante";
+import { connectMessage, verifyProof } from "./whoiam";
+export { personaName } from "./whoiam";
+import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } from "./cbor";
 
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
 export interface Schema { title: string; questions: Question[]; allowed?: string[]; rev?: number } // allowed = invited pubkeys (hex), absent = open poll
-export interface Response { ts: number; answers_json: string; sig: string }
-export interface FormState { schema_json: string; schema_sig: string; responses: Record<string, Response> }
+export interface Response { ts: number; answers_json: string; sig: string; ante?: string } // ante: open polls, hex CBOR proof
+export interface Cert { base: string; challenge: string; ts: number; sig: string } // a whoiam delegation, see below
+export interface FormState { schema_json: string; schema_sig: string; schema_cert?: Cert; responses: Record<string, Response> }
 export type Answers = Record<string, number | number[] | string>;
 
 const { bytesToHex: hex, hexToBytes: unhex } = ed.etc;
@@ -61,7 +67,7 @@ async function retrying<T>(f: () => Promise<T>, tries = 3): Promise<T> {
 // Every delegate request, registration included, is answered by one DelegateResponse and the replies carry
 // no request id: calls go one at a time and are matched by order.
 let delegateChain: Promise<unknown> = Promise.resolve();
-function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
+function sendDelegate(req: DelegateRequest, timeoutMs = 8000): Promise<DelegateResponse> {
   const run = async () => {
     let waiter!: Waiter;
     const reply = new Promise<DelegateResponse>((resolve, reject) => {
@@ -70,7 +76,7 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
       setTimeout(() => {
         const i = delegateWaiters.indexOf(waiter);
         if (i >= 0) { delegateWaiters.splice(i, 1); reject(new Error("delegate timeout")); }
-      }, 8000);
+      }, timeoutMs);
     });
     // the SDK has no delegate method yet: use its low-level sender
     const a = (await api()) as unknown as { sendRequest(r: ClientRequestT): void };
@@ -82,26 +88,38 @@ function sendDelegate(req: DelegateRequest): Promise<DelegateResponse> {
   return p;
 }
 
-async function registerDelegate() {
-  const code = new Uint8Array(await (await fetch(identityWasmUrl)).arrayBuffer());
+/** Hand a delegate's wasm to the node (idempotent) and return its key: blake3(blake3(wasm)) for empty parameters. */
+async function registerWasmDelegate(url: string, expectHash?: string): Promise<DelegateKeyT> {
+  const code = new Uint8Array(await (await fetch(url)).arrayBuffer());
   const codeHash = blake3(code);
-  delegateKey = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash)); // empty params: blake3(codeHash)
-  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), delegateKey);
+  if (expectHash && hex(codeHash) !== expectHash) throw new Error("unexpected delegate code");
+  const key = new DelegateKeyT(Array.from(blake3(codeHash)), Array.from(codeHash));
+  const wasm = new WasmDelegateV1T([], new DelegateCodeT(Array.from(code), Array.from(codeHash)), key);
   const container = new DelegateContainerT(DelegateType.WasmDelegateV1, wasm);
   // the node ignores cipher and nonce since freenet-core PR #4146 (secrets use a node-side key) but still checks their sizes
   await sendDelegate(new DelegateRequest(DelegateRequestType.RegisterDelegate, new RegisterDelegateT(container, new Array(32).fill(0), new Array(24).fill(0))));
+  return key;
+}
+
+/** One application message to a registered delegate; resolves with the payload of its reply. */
+async function messageDelegate(key: DelegateKeyT, payload: Uint8Array, timeoutMs?: number): Promise<Uint8Array> {
+  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(Array.from(payload), [], false));
+  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(key, [], [msg])), timeoutMs);
+  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
+  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
+  if (!m) throw new Error("empty delegate reply");
+  return new Uint8Array(m.payload);
+}
+
+async function registerDelegate() {
+  delegateKey = await registerWasmDelegate(identityWasmUrl);
 }
 
 // every delegate operation is safe to repeat (init keeps the first key, the rest are reads, signatures and overwrites)
 const callDelegate = (payload: object) => retrying(() => callDelegateOnce(payload));
 
 async function callDelegateOnce(payload: object): Promise<Record<string, any>> { // eslint-disable-line @typescript-eslint/no-explicit-any
-  const msg = new InboundDelegateMsgT(InboundDelegateMsgType.common_ApplicationMessage, new ApplicationMessageT(bytes(JSON.stringify(payload)), [], false));
-  const r = await sendDelegate(new DelegateRequest(DelegateRequestType.ApplicationMessages, new ApplicationMessagesT(delegateKey, [], [msg])));
-  // duck-typed: bundlers can duplicate the SDK classes, which breaks instanceof
-  const m = r.values.map((v) => v.inbound).find((x) => Array.isArray((x as ApplicationMessageT | null)?.payload)) as ApplicationMessageT | undefined;
-  if (!m) throw new Error("empty delegate reply");
-  const out = JSON.parse(new TextDecoder().decode(new Uint8Array(m.payload)));
+  const out = JSON.parse(new TextDecoder().decode(await messageDelegate(delegateKey!, enc.encode(JSON.stringify(payload)))));
   if (out.err) throw new Error(out.err);
   return out;
 }
@@ -178,6 +196,43 @@ export async function signAnswers(who: Identity, params: string, answers: Answer
   return { ts, answers_json, sig: await who.sign(`fpr1|${params}|${who.pk}|${ts}|${answers_json}`) };
 }
 
+// ---- open-poll anti-spam: ante (github.com/soudasuwa/ante), as in FreeTunes reports ----
+// The respondent's node asks for consent, the page grinds a few seconds of proof of work, the node signs it. The proof
+// is bound to the poll and the respondent key, so it is made once and reused when the answer changes.
+const CONSENT_MS = 75_000; // the node keeps the consent prompt open for 60 s
+let anteKey: Promise<DelegateKeyT> | undefined;
+async function anteCall(req: CborValue, timeoutMs?: number) {
+  const key = await (anteKey ??= registerWasmDelegate(anteWasmUrl, ANTE_CODE_HASH).catch((e) => { anteKey = undefined; throw e; }));
+  const out = enumVariant(cborDecode(await messageDelegate(key, cborEncode(req), timeoutMs)));
+  if (out.variant === "Error") throw new Error(`ante: ${String(mapGet(out.fields!, "message"))}`);
+  return out;
+}
+
+export class VoteDeclined extends Error { constructor() { super("You declined the proof of work, so the answer was not sent."); } }
+
+/** The ante proof (hex) for answering poll `params` as `pk`. `step` narrates what is happening. */
+export async function voteProof(params: string, pk: string, step: (msg: string) => void = () => {}): Promise<string> {
+  const purpose = votePurpose(params, pk);
+  step("Opening your ante identity…");
+  const vk = asBytes(mapGet((await anteCall("GetIdentity")).fields!, "verifying_key"));
+  step("Your Freenet node asks you to allow a few seconds of anti-spam work. Approve it there…");
+  const grant = await anteCall({ RequestGrind: { purpose, min_bits: VOTE_BITS } }, CONSENT_MS);
+  if (grant.variant === "Denied") throw new VoteDeclined();
+  const challenge = asBytes(mapGet(grant.fields!, "bytes"));
+  if (hex(challenge) !== hex(challengeBytes(purpose, vk))) throw new Error("ante returned an unexpected challenge");
+  const nonce = await grind(challenge, VOTE_BITS, (n) => step(`Working… ${n.toLocaleString()} tries`));
+  step("Signing…");
+  const signed = await anteCall({ Commit: { purpose, nonce, min_bits: VOTE_BITS, ts: Date.now() } }, CONSENT_MS);
+  if (signed.variant === "Denied") throw new VoteDeclined();
+  const proof = asBytes(mapGet(signed.fields!, "proof"));
+  await checkProof(proof, purpose); // catch a bad proof here: the node would only answer "Request timeout"
+  return hex(proof);
+}
+
+/** Polls published by this contract version check ante on open polls; older ones were published without it. */
+export const needsAnte = async (instance: string, params: string, schema: Schema) =>
+  !schema.allowed && (await build(wasmUrl, unhex(params))).key.encode() === instance;
+
 // ---- node connection ----
 type Listener = () => void;
 const listeners = new Set<Listener>();
@@ -240,9 +295,10 @@ export const sendResponse = (instance: string, pk: string, r: Response) =>
 
 /** Owner only: sign a new schema with the same questions and a new title. The contract keeps the highest rev. */
 export async function rename(instance: string, params: string, schema: Schema, title: string) {
+  const me = await requireSession();
   const schema_json = JSON.stringify({ ...schema, title, rev: (schema.rev ?? 0) + 1 });
-  const sig = await (await identity()).sign(`fps1|${params}|${schema_json}`);
-  await sendDelta(instance, { schema: [schema_json, sig], responses: {} });
+  const sig = await me.sign(`fps1|${params}|${schema_json}`);
+  await sendDelta(instance, { schema: [schema_json, sig, me.cert], responses: {} });
 }
 
 /** Contract code + key. Instance id = blake3(blake3(wasm) || params), same as freenet-stdlib. */
@@ -260,12 +316,98 @@ async function putContract(wasm: string, params: Uint8Array, state: object) {
   return key.encode();
 }
 
-/** Publish a new poll. Parameters = owner pubkey || random salt, so one owner can run many polls. */
+// ---- owner identity: a whoiam persona, through a delegated app key ----
+// whoiam signs `wd1.<app key>.<nonce>` for this app's address: "this app key may act for me in FreePolls"
+// (whoiam-delegation, in the freenames repo). The persona owns the polls; the app key only signs for it.
+// The app key is NOT the respondent key above: delegations are public, and answers must not be linkable to a persona.
+
+/** The app's own path: delegations and poll parameters are bound to it (in dev, "/"). */
+const APP_PATH = location.pathname;
+export const APP_PATH_HEX = hex(enc.encode(APP_PATH));
+
+const appSecret = async () => {
+  let h = await storeGet("app-sk");
+  if (!h) await storePut("app-sk", (h = hex(ed.utils.randomPrivateKey())));
+  return h;
+};
+
+export interface Session { persona: string; cert: Cert; sign: (msg: string) => Promise<string> }
+
+/** The signed-in persona, if its delegation still holds for this node's app key. */
+export async function session(): Promise<Session | null> {
+  const raw = await storeGet("session");
+  if (!raw) return null;
+  const { persona, cert } = JSON.parse(raw) as { persona: string; cert: Cert };
+  const sk = unhex(await appSecret());
+  if (cert.challenge.split(".")[1] !== hex(await ed.getPublicKeyAsync(sk))) return null; // app key changed: sign in again
+  return { persona, cert, sign: async (m) => hex(await ed.signAsync(enc.encode(m), sk)) };
+}
+
+async function requireSession(): Promise<Session> {
+  const s = await session();
+  if (!s) throw new Error("Sign in first.");
+  return s;
+}
+
+/** Forget the sign-in, and the persona key if it was made here (the user was told to save it first). */
+export const signOut = async () => { await storePut("session", ""); await storePut("persona-key", ""); };
+
+/** The official Viso web contract; any other Viso site on this node can be used instead. */
+export const VISO_KEY = "GzHy3jnEtj26EoGqMsBpoawcY378hK9kp91rTcNYiAac";
+export const WHOIAM_KEY = VISO_KEY;
+export const officialViso = () => `${location.protocol}//${location.host}/v1/contract/web/${VISO_KEY}/`;
+export const officialWhoiam = officialViso;
+const LINK_MAX_AGE_MS = 10 * 60 * 1000;
+const linkBase = () => `${location.protocol}//${location.host}${APP_PATH}`; // Viso binds its proof to it
+
+/** Where to send the user to sign in. Remembers the one-time challenge in the delegate store. */
+export async function startSignIn(visoUrl: string): Promise<string> {
+  const u = new URL(visoUrl);
+  if (u.host !== location.host || !/^\/v[12]\/contract\/web\/[^/]+\/?$/.test(u.pathname)) {
+    throw new Error("Paste the address of your Viso site on this node (it starts with the same host as this page).");
+  }
+  const appKey = hex(await ed.getPublicKeyAsync(unhex(await appSecret())));
+  const challenge = `wd1.${appKey}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`;
+  await storePut("signin-pending", challenge);
+  return `${u.origin}${u.pathname}?connect=v1&challenge=${challenge}&return=${encodeURIComponent(linkBase())}`;
+}
+
+/** Handle Viso's callback: check challenge, freshness and signature, then keep the delegation. */
+export async function finishSignIn(q: URLSearchParams): Promise<string> {
+  if (q.get("viso") === "denied" || q.get("whoiam") === "denied") throw new Error("You chose not to share a persona.");
+  const pending = await storeGet("signin-pending");
+  await storePut("signin-pending", ""); // one use: burn it whatever happens next
+  const persona = q.get("pk") ?? "";
+  const cert: Cert = { base: linkBase(), challenge: q.get("challenge") ?? "", ts: Number(q.get("ts")), sig: q.get("sig") ?? "" };
+  if (!pending || cert.challenge !== pending) throw new Error("This sign-in is unknown or was already used. Start again.");
+  if (!Number.isFinite(cert.ts) || Math.abs(Date.now() - cert.ts) > LINK_MAX_AGE_MS) throw new Error("The proof is too old or its clock is off. Start again.");
+  if (!(await verifyProof({ ...cert, pk: persona }))) throw new Error("Viso signature does not verify.");
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
+}
+
+/** A persona made here instead of in Viso: a new key (or an imported one, hex) signs the same proof Viso would. */
+export async function createLocalIdentity(secretHex?: string): Promise<string> {
+  const sk = secretHex?.replace(/\s/g, "").toLowerCase() || hex(ed.utils.randomPrivateKey());
+  if (!/^[0-9a-f]{64}$/.test(sk)) throw new Error("The key must be 64 hexadecimal characters.");
+  const persona = hex(await ed.getPublicKeyAsync(sk));
+  const appKey = hex(await ed.getPublicKeyAsync(unhex(await appSecret())));
+  const cert: Cert = { base: linkBase(), challenge: `wd1.${appKey}.${hex(crypto.getRandomValues(new Uint8Array(16)))}`, ts: Date.now(), sig: "" };
+  cert.sig = hex(await ed.signAsync(connectMessage(unhex(persona), cert.base, cert.challenge, cert.ts), sk));
+  await storePut("persona-key", sk);
+  await storePut("session", JSON.stringify({ persona, cert }));
+  return persona;
+}
+
+/** The secret key of a persona made here (hex), for the user to back up; null for a Viso persona. */
+export const localIdentityKey = async () => (await storeGet("persona-key")) || null;
+
+/** Publish a new poll. Parameters = owner persona || random salt || app path, so one owner can run many polls. */
 export async function publish(schema: Schema) {
-  const me = await identity();
-  const params = me.pk + hex(crypto.getRandomValues(new Uint8Array(16)));
+  const me = await requireSession();
+  const params = me.persona + hex(crypto.getRandomValues(new Uint8Array(16))) + APP_PATH_HEX;
   const schema_json = JSON.stringify(schema);
-  const state: FormState = { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), responses: {} };
+  const state: FormState = { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), schema_cert: me.cert, responses: {} };
   return { instance: await putContract(wasmUrl, unhex(params), state), params };
 }
 
@@ -273,7 +415,7 @@ export async function publish(schema: Schema) {
 // The registry address depends on the admin key (its parameter): changing the key creates a new directory.
 export const REGISTRY_ADMIN = "4f3738821e50c271f498aa23a5a569802a418768c84d2a6bd7f643a2d3359d6c";
 const POW_BITS = 18; // must match the contract (sha256, about 3 s of mining)
-export interface RegEntry { params: string; title: string; ts: number; nonce: number; sig: string }
+export interface RegEntry { params: string; title: string; ts: number; nonce: number; sig: string; cert: Cert }
 export interface RegState { entries: Record<string, RegEntry>; blocked: { ts: number; list: string[]; sig: string } }
 
 let regId: Promise<string> | undefined;
@@ -297,7 +439,7 @@ const zeroBits = (h: Uint8Array) => {
 
 /** List a poll you own: sign the entry and mine the proof-of-work (a few seconds). */
 export async function listPoll(instance: string, params: string, title: string) {
-  const me = await identity(); // must be the poll owner (first 32 bytes of params)
+  const me = await requireSession(); // must be the poll owner (first 32 bytes of params)
   const ts = Date.now(), msg = `fpl1|${instance}|${params}|${title}|${ts}`;
   const sig = await me.sign(msg);
   let nonce = 0;
@@ -305,7 +447,7 @@ export async function listPoll(instance: string, params: string, title: string) 
     if (++nonce % 20000 === 0) await new Promise((r) => setTimeout(r)); // let the page breathe while mining
   }
   await loadRegistry(); // makes sure it exists and caches its full key for the update
-  await sendDelta(await registryId(), { entries: { [instance]: { params, title, ts, nonce, sig } } });
+  await sendDelta(await registryId(), { entries: { [instance]: { params, title, ts, nonce, sig, cert: me.cert } } });
 }
 
 /** Admin only: replace the blocklist (blocked polls disappear from the directory). */

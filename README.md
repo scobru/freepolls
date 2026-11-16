@@ -5,16 +5,16 @@ Polls and forms on [Freenet](https://freenet.org). No server, no account: every 
 - **Contract**: Rust compiled to WASM (`contract/`).
 - **UI**: TypeScript + Vite, no framework (`ui/`). Talks to the node through [`@freenetorg/freenet-stdlib`](https://freenet.org/build/manual/typescript-sdk).
 - **Invite-only polls**: one personal link = one vote, no accounts and no external services.
-- **Stable identity**: the signing key and the owner's data live in a Freenet delegate, so they survive sessions even inside the sandboxed web container.
+- **Owner = your whoiam persona**: polls belong to your [whoiam](https://github.com/skandragon/freenet-whoiam) persona, through a one-time delegation (see *Owner identity*). Respondents stay anonymous: their key lives in a Freenet delegate and is never linked to a persona.
 - **Question types**: single choice, multiple choice, free text, and **availability** (Doodle-style: one yes / maybe / no per date slot, with the best slot highlighted). Required flag, reordering, live results.
 
 ## How it works
 
-One contract instance per poll. The contract **parameters** are the owner's ed25519 public key (32 bytes) followed by a random 16-byte salt. The salt gives every poll its own address, so one owner can run any number of polls:
+One contract instance per poll. The contract **parameters** are the owner's whoiam persona key (32 bytes), a random 16-byte salt and the app's path (`/v1/contract/web/<FreePolls id>/`). The salt gives every poll its own address, so one owner can run any number of polls:
 
 ```
 code_hash   = blake3(contract.wasm)
-instance_id = blake3(code_hash || owner_pubkey || salt)
+instance_id = blake3(code_hash || persona_pubkey || salt || app_path)
 ```
 
 The UI computes the same id before publishing (same derivation as `freenet-stdlib`), so the link is known up front.
@@ -24,7 +24,8 @@ The UI computes the same id before publishing (same derivation as `freenet-stdli
 ```jsonc
 {
   "schema_json": "{\"title\":\"...\",\"questions\":[{\"id\":\"q1\",\"kind\":\"single\",\"text\":\"...\",\"options\":[\"a\",\"b\"],\"required\":true}]}",
-  "schema_sig":  "<hex ed25519 signature by the owner>",
+  "schema_sig":  "<hex ed25519 signature by the owner's delegated app key>",
+  "schema_cert": { "base": "<FreePolls address>", "challenge": "wd1.<app key>.<nonce>", "ts": 0, "sig": "<persona's whoiam signature>" },
   "responses": {
     "<respondent pubkey hex>": { "ts": 1791409999000, "answers_json": "{\"q1\":1}", "sig": "<hex>" }
   }
@@ -40,7 +41,17 @@ At creation the UI generates one ed25519 keypair per invite: the public key goes
 - The invite secrets exist only in the browser that created the poll. They are shown once after publishing and, where `localStorage` is available, kept so the owner can see them again. They cannot be recomputed.
 - The number of invites is fixed when the poll is created.
 - Anyone holding a personal link can vote as that invite, so share each link with one person only.
-- Open polls (no `allowed`) behave as before: one response per key, and keys are free to create.
+- Open polls (no `allowed`) take one response per key, and each respondent must carry an ante proof of work (below).
+
+### Open polls and ante
+
+Keys are free to create, so an open poll asks each respondent for a proof of work from [ante](https://github.com/soudasuwa/ante), as FreeTunes does for reports. The response carries `ante`: the hex CBOR `AnteProof` signed by the respondent's *ante identity*, which lives in the ante delegate on their own node (`ui/src/ante-delegate.wasm`, pinned by blake3 `f10f40a3...925f`).
+
+- Purpose `freepolls:vote:v2:<blake3(params_hex) hex>:<respondent_hex>` (the full params, app path included, would exceed ante's 256-byte purpose limit), at least 18 bits of work (a few seconds in the browser). The node asks the respondent's consent before any work is spent.
+- The proof is bound to the poll and the respondent key, not the answers, so changing an answer reuses it.
+- One respondent per ante identity. If two respondent keys carry the same ante identity, the smaller key is kept, so every merge order converges.
+- It raises the cost of each fake respondent; it does not prove one person = one vote: someone willing to grind can still answer many times with many ante identities.
+- Polls published before this contract version have no ante check; the UI only asks for the work where the poll's address matches the current contract.
 
 Answer values by question kind: `single` = option index, `multi` = list of option indexes, `text` = string, `avail` = one value per option (slot) in order, `0` = no, `1` = yes, `2` = maybe. The best availability slot is the one with most "yes", ties broken by "maybe".
 
@@ -50,7 +61,7 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 
 | What | Signer | Message |
 | --- | --- | --- |
-| Schema | owner | `fps1\|<params_hex>\|<schema_json>` |
+| Schema | owner's delegated app key | `fps1\|<params_hex>\|<schema_json>` |
 | Answers | respondent | `fpr1\|<params_hex>\|<respondent_hex>\|<ts>\|<answers_json>` |
 
 `params_hex` is the full contract parameters (owner key plus salt). Binding both messages to it stops a signed schema from being cloned into another poll, and stops a response from being replayed into another poll, even one by the same owner.
@@ -58,7 +69,8 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 ### Contract rules (`contract/src/lib.rs`)
 
 - `validate_state`: schema signature valid; every response signature valid; every answer matches the schema (known question ids, option indexes in range, `avail` length equal to the number of slots, required questions answered, text up to 2000 bytes).
-- `update_state`: the schema is set once. Responses merge **per respondent, last write wins by `ts`**. Older or equal `ts` is ignored. Anything invalid rejects the update.
+- `validate_state`: open polls also need a valid ante proof per respondent and no ante identity used twice.
+- `update_state`: the schema is set once. Responses merge **per respondent, last write wins by `ts`**. Older or equal `ts` is ignored. For open polls, a respondent whose ante identity is already held by a smaller key is ignored, and one held by a larger key is replaced. Anything invalid rejects the update.
 - `summarize_state` / `get_state_delta`: summary = `{ has_schema, responses: pubkey -> ts }`; delta = the schema if the peer lacks it, plus responses newer than the peer's summary. An empty summary or empty state means "nothing known yet" (the node sends one on subscribe).
 
 ### UI (`ui/src/`)
@@ -66,6 +78,16 @@ Answer values by question kind: `single` = option index, `multi` = list of optio
 - `lib.ts`: ed25519 identity (stored key or invite secret) and signing (`@noble/ed25519`), blake3 key derivation, WebSocket API wrapper, publish / get / update / subscribe.
 - `main.ts`: hash router. `#/` is the poll builder, `#/f/<instance>.<params>[/i/<invite_secret>]`, `#/explore` is the public directory is the fill-in and results page. Inside the Freenet container the router also posts the hash to the shell so the address bar stays shareable. On an update notification the UI refetches the full state.
 - The bundled `ui/src/contract.wasm` is what gets published with each new poll. Rebuild and copy it after any contract change.
+
+## Owner identity: whoiam delegation
+
+The owner of a poll is a whoiam persona, not a key kept by FreePolls. Sign in once per node:
+
+1. The page keeps a random **app key** (in the delegate store). It opens whoiam's sign-in with the challenge `wd1.<app key>.<nonce>`.
+2. whoiam signs, with the persona you pick, `"whoiam-connect-v1" ‖ persona ‖ len ‖ return_base ‖ len ‖ challenge ‖ ts`, where `return_base` is FreePolls' address: *this app key may act for me in FreePolls*. That is the **delegation**.
+3. The schema and the directory entry are signed by the app key and carry the delegation. The contracts check it with [`whoiam-delegation`](https://github.com/scobru/freenames/tree/main/delegation) (a git dependency on the FreeNames repo), including that its path is the app path in the poll's parameters.
+
+A new node or a lost one is just another sign-in; there is nothing to back up. The app key is kept apart from the respondent key, because delegations are public and answers must not be linkable to a persona. Polls published before this change keep working, but show no owner tools.
 
 ## Identity delegate
 
@@ -82,7 +104,7 @@ Inside the Freenet web container the page is sandboxed without storage, so a key
 
 Polls can opt in to a shared directory, shown on the **Explore** page. It is a second contract (`registry/`), one instance per admin key (the admin public key is its parameter).
 
-- **Listing.** In the builder, tick "List in the public directory" (off by default, never available for invite-only polls). The owner of an open poll can also list it later with the button on the poll page. The UI signs an entry `fpl1|<instance>|<params>|<title>|<ts>` with the owner key and attaches a proof-of-work nonce.
+- **Listing.** In the builder, tick "List in the public directory" (off by default, never available for invite-only polls). The owner of an open poll can also list it later with the button on the poll page. The UI signs an entry `fpl1|<instance>|<params>|<title>|<ts>` with the owner's delegated app key, attaches the delegation and a proof-of-work nonce. Explore only shows polls whose app path is this app's.
 - **Proof-of-work.** `sha256("<message>|<nonce>")` must start with 18 zero bits (about 260k hashes, a few seconds in the browser). It makes bulk spam costly, but a determined flooder can still push older polls out.
 - **Size.** The newest 500 entries are kept (deterministic pruning, so merge order does not matter). Titles are limited to 120 characters.
 - **Moderation.** The admin key can publish a signed blocklist (`fpb1|<ts>|<ids>`); blocked polls vanish from the directory and cannot be re-added. The admin page is at `#/admin` (not linked anywhere): paste the admin secret and the ids to hide. Entries are not checked against the polls themselves, so an entry can point to a poll that does not exist.
@@ -98,6 +120,7 @@ Requirements: `rustup` with the `wasm32-unknown-unknown` target, `freenet` and `
 ```bash
 # contract: test, build, copy the wasm into the UI
 cargo test
+(cd ui && npm test)   # the ante proof as the UI builds it
 cargo build --release --target wasm32-unknown-unknown -p freepolls-contract -p freepolls-registry -p freepolls-identity
 cp target/wasm32-unknown-unknown/release/freepolls_contract.wasm ui/src/contract.wasm
 cp target/wasm32-unknown-unknown/release/freepolls_registry.wasm ui/src/registry.wasm
@@ -142,12 +165,14 @@ fdev website update dist --key freepolls
 ## Limitations
 
 - **Answers are public.** Anyone with the poll link can read the state. Do not collect personal or sensitive data: Freenet has no global delete, so published polls and answers cannot be withdrawn.
-- **Open polls: one response per key, not per person.** Anyone can generate more keys. Use an invite-only poll when the vote count matters.
+- **Open polls: one response per ante identity, not per person.** Each extra identity costs a few seconds of work, which slows spam but does not stop a determined grinder. Use an invite-only poll when the vote count matters.
 - Changing the contract changes its code hash: polls already published keep running the old contract.
 - `subscribe()` does not resolve in local mode, so the UI does not wait for it.
 - No way to close a poll yet.
 
-- **The identity belongs to your node.** A different node or computer is a different identity (Freenet does not sync delegates across devices yet). Polls and answers stay valid; you just cannot edit them from the other node.
+- **Answers belong to your node.** A different node is a different respondent (Freenet does not sync delegates across devices yet). Poll ownership follows your whoiam persona instead.
+- **Delegations do not expire or get revoked yet** (contracts have no clock): whoever controls a node you signed in from can publish and list polls as your persona.
+- whoiam's sign-in is used for something it does not advertise: it shows "sign in to <origin>", not "authorize this key". Switch to whoiam's own cross-app delegation when it exists.
 
 ## Roadmap
 
@@ -155,7 +180,7 @@ fdev website update dist --key freepolls
 - Owner-signed "closed" flag.
 - Conditional questions, import/export of results.
 - Directory: re-check entries against the polls themselves, search, pagination.
-- Optional anti-spam stamps for open polls ([ante](https://github.com/soudasuwa/ante) proof-of-work or [Ghost Keys](https://freenet.org/ghostkey/)). Both only raise the cost of fake identities; neither proves one person = one vote.
+- [Ghost Keys](https://freenet.org/ghostkey/) as a stronger alternative to ante for open polls.
 - Re-issue or add invites after creation.
 
 ## License

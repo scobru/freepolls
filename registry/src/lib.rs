@@ -1,12 +1,13 @@
 //! Public poll directory. One shared instance; parameters = admin ed25519 pubkey (32 bytes).
-//! Anyone can list a poll by signing the entry with the poll owner's key and attaching a
-//! proof-of-work nonce. The admin can block instances with a signed blocklist.
+//! The poll owner (a whoiam persona) lists a poll by signing the entry with an app key it delegated for the
+//! poll's app path (see `whoiam-delegation`), attaching the delegation and a proof-of-work nonce. The admin can block instances with a signed blocklist.
 //! State is JSON; the newest MAX_ENTRIES entries are kept.
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use whoiam_delegation::{check, Cert};
 
 pub const POW_BITS: u32 = 18;
 pub const MAX_ENTRIES: usize = 500;
@@ -14,11 +15,12 @@ const MAX_TITLE: usize = 120;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Entry {
-    pub params: String, // poll parameters, hex: owner pubkey (32 bytes) || salt
+    pub params: String, // poll parameters, hex: owner persona (32 bytes) || salt (16) || app path
     pub title: String,
     pub ts: u64,
     pub nonce: u64,
-    pub sig: String, // hex, by the poll owner over `fpl1|<instance>|<params>|<title>|<ts>`
+    pub sig: String, // hex, by the owner's delegated app key over `fpl1|<instance>|<params>|<title>|<ts>`
+    pub cert: Cert,  // the owner's delegation to that key, for the app path in `params`
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -87,9 +89,11 @@ fn check_entry(instance: &str, e: &Entry) -> R<()> {
     if t == 0 || t > MAX_TITLE || e.title.chars().any(char::is_control) {
         return Err("bad title".into());
     }
-    let owner = e.params.get(..64).ok_or("params too short")?;
+    let raw = hex::decode(&e.params).map_err(|e| e.to_string())?;
+    let app = std::str::from_utf8(raw.get(48..).ok_or("params too short")?).map_err(|e| e.to_string())?;
+    let app_key = check(&e.params[..64], app, &e.cert)?;
     let msg = format!("fpl1|{instance}|{}|{}|{}", e.params, e.title, e.ts);
-    verify(&key(owner)?, msg.as_bytes(), &e.sig)?;
+    verify(&app_key, msg.as_bytes(), &e.sig)?;
     let h = Sha256::digest(format!("{msg}|{}", e.nonce).as_bytes());
     if zero_bits(&h) < POW_BITS {
         return Err("insufficient proof of work".into());
@@ -240,6 +244,7 @@ impl ContractInterface for Contract {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use whoiam_delegation::connect_message;
 
     fn sk(n: u8) -> SigningKey {
         SigningKey::from_bytes(&[n; 32])
@@ -250,13 +255,19 @@ mod tests {
 
     /// Valid entry for `instance`, mining a real nonce (about 2^18 hashes).
     fn entry(instance: &str, owner: &SigningKey, title: &str, ts: u64) -> Entry {
-        let o = format!("{}{}", pk(owner), "cd".repeat(16));
+        let app = "/v1/contract/web/Polls1/";
+        let o = format!("{}{}{}", pk(owner), "cd".repeat(16), hex::encode(app));
+        // the owner persona delegates an app key for the poll's app path
+        let app_key = sk(100);
+        let (base, challenge) = (format!("http://127.0.0.1:7509{app}"), format!("wd1.{}.n1", pk(&app_key)));
+        let csig = owner.sign(&connect_message(owner.verifying_key().as_bytes(), &base, &challenge, 1));
+        let cert = Cert { base, challenge, ts: 1, sig: hex::encode(csig.to_bytes()) };
         let msg = format!("fpl1|{instance}|{o}|{title}|{ts}");
-        let sig = hex::encode(owner.sign(msg.as_bytes()).to_bytes());
+        let sig = hex::encode(app_key.sign(msg.as_bytes()).to_bytes());
         let nonce = (0u64..)
             .find(|n| zero_bits(&Sha256::digest(format!("{msg}|{n}").as_bytes())) >= POW_BITS)
             .unwrap();
-        Entry { params: o, title: title.into(), ts, nonce, sig }
+        Entry { params: o, title: title.into(), ts, nonce, sig, cert }
     }
 
     fn block(admin: &SigningKey, ts: u64, list: &[&str]) -> Blocklist {
@@ -287,6 +298,10 @@ mod tests {
         let mut forged = entry("PollB", &sk(3), "Hi", 5);
         forged.title = "Not signed".into();
         assert!(apply(&a, &mut s, Delta { entries: [("PollB".into(), forged)].into(), blocked: None }).is_err());
+        // listed under another persona than the one that delegated the key
+        let mut stolen = entry("PollB", &sk(3), "Hi", 5);
+        stolen.params = stolen.params.replacen(&pk(&sk(3)), &pk(&sk(4)), 1);
+        assert!(check_entry("PollB", &stolen).is_err());
         let mut lazy = entry("PollB", &sk(3), "Hi", 5);
         lazy.nonce += 1; // almost surely no longer meets the difficulty (fails with probability 2^-18)
         assert!(check_entry("PollB", &lazy).is_err());
@@ -314,7 +329,8 @@ mod tests {
 
     #[test]
     fn prune_keeps_newest() {
-        let fake = |ts| Entry { params: String::new(), title: String::new(), ts, nonce: 0, sig: String::new() };
+        let cert = Cert { base: String::new(), challenge: String::new(), ts: 0, sig: String::new() };
+        let fake = |ts| Entry { params: String::new(), title: String::new(), ts, nonce: 0, sig: String::new(), cert: cert.clone() };
         let mut m: BTreeMap<String, Entry> = (1..=5u64).map(|i| (format!("p{i}"), fake(i))).collect();
         prune(&mut m, 3);
         assert_eq!(m.keys().cloned().collect::<Vec<_>>(), ["p3", "p4", "p5"]);

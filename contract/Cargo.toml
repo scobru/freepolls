@@ -8,11 +8,15 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+whoiam-delegation = { git = "https://github.com/scobru/freenames", rev = "d6dc35f8d0d85c0d95430c5da3c3eeb8e9ee9120" } # the poll owner is a whoiam persona
 freenet-stdlib = { version = "0.8", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", default-features = false }
 hex = "0.4"
+blake3 = { version = "1", default-features = false } # vote_purpose; already in the tree through ante-core
+# ante: proof-of-work commitments signed by the node-held ante delegate (same rev as FreeTunes)
+ante-core = { git = "https://github.com/soudasuwa/ante", rev = "80c0673cbfb58a3bde413274787959a0b502901b", default-features = false }
 
 [features]
 default = ["freenet-main-contract"]

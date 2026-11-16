@@ -1,6 +1,7 @@
 import "./style.css";
 import {
-  blockPolls, identity, identityFrom, listPoll, loadRegistry, loadState, newInvites, onRemoteChange, publish, rename, sendResponse, signAnswers, storeGet, storePut, watch,
+  APP_PATH_HEX, blockPolls, createLocalIdentity, finishSignIn, localIdentityKey, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
+  personaName, publish, rename, sendResponse, session, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -12,9 +13,11 @@ const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.q
 function route() {
   // inside the Freenet container, keep the address bar in sync so the URL is shareable
   if (window.parent !== window) parent.postMessage({ __freenet_shell__: true, type: "hash", hash: location.hash || "#/" }, "*");
+  const searchParams = new URLSearchParams(location.search);
+  if (searchParams.has("viso") || searchParams.has("whoiam")) return signInCallback(searchParams);
   if (location.hash === "#/explore") return explore();
   if (location.hash === "#/admin") return admin(); // not linked anywhere
-  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96})(?:\/i\/([0-9a-f]{64}))?$/);
+  const m = location.hash.match(/^#\/f\/([1-9A-HJ-NP-Za-km-z]+)\.([0-9a-f]{96,})(?:\/i\/([0-9a-f]{64}))?$/);
   return m ? form(m[1], m[2], m[3]) : builder();
 }
 // page URL without the container's ?__sandbox=1 query
@@ -28,11 +31,19 @@ const saveForm = async (f: Saved) => storePut("polls", JSON.stringify([f, ...(aw
 // ---------------- builder ----------------
 function builder() {
   const qs: Question[] = [{ id: "q1", kind: "single", text: "", options: ["", ""], required: true }];
-  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [];
+  let title = "", inviteOnly = false, listed = false, nInvites = 10, mine: Saved[] = [], me: Session | null | undefined, key: string | null = null;
   const draw = () => {
     app.innerHTML = `
       <h1>FreePolls <small>polls and forms on Freenet</small></h1>
       <p><a href="#/explore">Explore public polls &rarr;</a></p>
+      ${me === undefined ? `<p class="muted">Checking your sign-in…</p>`
+        : me ? `<p class="muted">Publishing as the ${key ? "identity" : "Viso persona"} <code>${esc(personaName(me.persona))}</code> · <button id="so" type="button">Sign out</button></p>
+           ${key ? `<div class="card"><p class="muted">This identity was made here, so its key is the only way to get it back. Keep it secret: whoever has it can publish as you.</p>
+           <p><button id="kshow" type="button">Show key</button> <button id="kdl" type="button">Download key</button></p><p><code id="kval" hidden>${esc(key)}</code></p></div>` : ""}`
+        : `<div class="card"><p>Polls belong to your <b>Viso</b> persona: sign in once on this node to publish. Answering needs no sign-in, and answers are never linked to your persona.</p>
+           <p><input id="wurl" value="${esc(officialViso())}" spellcheck="false" /> <button id="wgo" type="button" class="primary">Sign in with Viso</button> <span id="wmsg" class="muted"></span></p>
+           <p class="muted">Or create an identity here, no Viso needed: FreePolls makes a new key on this node. You get a key to back up, and pasting it here (in this or another Freenet app, on any node) brings the same identity back.</p>
+           <p><button id="lnew" type="button">Create identity</button> <input id="lkey" type="password" placeholder="Already have a key? Paste it" spellcheck="false" autocomplete="off" /> <button id="limport" type="button">Use this key</button> <span id="lmsg" class="muted"></span></p></div>`}
       <input id="title" placeholder="Title" value="${esc(title)}" />
       ${qs.map((q, i) => `
         <section class="card" data-i="${i}">
@@ -47,11 +58,44 @@ function builder() {
         </section>`).join("")}
       <label><input type="checkbox" id="io" ${inviteOnly ? "checked" : ""}/> Invite only: one personal link = one vote</label>
       ${inviteOnly ? `<label>Number of invites <input id="ni" type="number" min="1" max="200" value="${nInvites}" /></label>` : ""}
-      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your owner key become discoverable)</label>
+      <label><input type="checkbox" id="ls" ${listed && !inviteOnly ? "checked" : ""} ${inviteOnly ? "disabled" : ""}/> List in the public directory (the title and your Viso persona become discoverable)</label>
       <p><button id="add" type="button">+ Question</button> <button id="pub" type="button" class="primary">Publish</button></p>
       <p id="msg"></p>
       <div id="mine"></div>`;
-    $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f) => `<li><a href="${esc(f.hash)}">${esc(f.title)}</a></li>`).join("")}</ul>` : "";
+    const so = app.querySelector<HTMLButtonElement>("#so");
+    if (so) so.onclick = async () => {
+      if (key && !confirm("Signing out deletes the key from this node. Without your backup this identity is lost. Sign out?")) return;
+      await signOut(); me = null; key = null; draw();
+    };
+    const kshow = app.querySelector<HTMLButtonElement>("#kshow");
+    if (kshow) kshow.onclick = () => { $("#kval").hidden = !$("#kval").hidden; };
+    const kdl = app.querySelector<HTMLButtonElement>("#kdl");
+    if (kdl && key && me) kdl.onclick = () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([`FreePolls identity key: keep it secret.\n${key}\n`], { type: "text/plain" }));
+      a.download = `identity-${personaName(me!.persona).slice(0, 8)}.txt`;
+      a.click();
+    };
+    const local = async (k?: string) => {
+      try { await createLocalIdentity(k); [me, key] = [await session(), await localIdentityKey()]; draw(); }
+      catch (e) { $("#lmsg").textContent = String((e as Error).message ?? e); }
+    };
+    const lnew = app.querySelector<HTMLButtonElement>("#lnew");
+    if (lnew) lnew.onclick = () => local();
+    const limport = app.querySelector<HTMLButtonElement>("#limport");
+    if (limport) limport.onclick = () => local($<HTMLInputElement>("#lkey").value);
+    const wgo = app.querySelector<HTMLButtonElement>("#wgo");
+    if (wgo) wgo.onclick = async () => {
+      try { $("#wmsg").textContent = "Opening Viso…"; goTo(await startSignIn($<HTMLInputElement>("#wurl").value.trim())); }
+      catch (e) { $("#wmsg").textContent = String((e as Error).message ?? e); }
+    };
+    $("#mine").innerHTML = mine.length ? `<h2>My polls</h2><ul>${mine.map((f, i) =>
+      `<li><a href="${esc(f.hash)}">${esc(f.title)}</a> <button class="forget" type="button" data-i="${i}" title="Remove from this list (the poll stays online)" aria-label="Remove ${esc(f.title)} from my polls">&times;</button></li>`).join("")}</ul>` : "";
+    app.querySelectorAll<HTMLButtonElement>(".forget").forEach((b) => (b.onclick = async () => {
+      mine = mine.filter((_, i) => i !== +b.dataset.i!);
+      await storePut("polls", JSON.stringify(mine));
+      draw();
+    }));
     $<HTMLInputElement>("#title").oninput = (e) => (title = (e.target as HTMLInputElement).value);
     $<HTMLInputElement>("#io").onchange = (e) => { inviteOnly = (e.target as HTMLInputElement).checked; if (inviteOnly) listed = false; draw(); };
     $<HTMLInputElement>("#ls").onchange = (e) => (listed = (e.target as HTMLInputElement).checked);
@@ -100,13 +144,35 @@ function builder() {
   };
   draw();
   void myForms().then((m) => { if (m.length) { mine = m; draw(); } });
+  const loadMe = async () => {
+    let s = await session();
+    key = await localIdentityKey();
+    if (!s && key) { await createLocalIdentity(key); s = await session(); } // made here, but the app key changed: sign again
+    return s;
+  };
+  void loadMe().catch(() => null).then((s) => { me = s; draw(); });
+}
+
+// ---------------- Viso sign-in ----------------
+// Inside the node's container the page is a sandboxed iframe: leaving it goes through the shell.
+const goTo = (href: string) => (window.parent !== window ? parent.postMessage({ __freenet_shell__: true, type: "navigate", href }, "*") : void (location.href = href));
+
+/** Viso sent the user back here with its proof (or a refusal). */
+async function signInCallback(q: URLSearchParams) {
+  app.innerHTML = "<p>Checking the proof…</p>";
+  let html: string;
+  try { html = `<p>Signed in as the Viso persona <code>${esc(personaName(await finishSignIn(q)))}</code>.</p>`; }
+  catch (e) { html = `<p class="err">${esc(String((e as Error).message ?? e))}</p>`; }
+  history.replaceState(null, "", `${location.pathname}#/`); // drop the one-time query
+  app.innerHTML = `${html}<p><a href="#/">Back to FreePolls</a></p>`;
 }
 
 // ---------------- public directory ----------------
 async function explore() {
   app.innerHTML = `<p><a href="#/">\u2190 New poll</a></p><h1>Public polls</h1><div id="list">Loading... (the first visit on a node can take up to 30 s)</div>`;
   try {
-    const rows = Object.entries((await loadRegistry()).entries).sort(([, a], [, b]) => b.ts - a.ts);
+    // only polls of this app: an entry is checked against the app path in its own parameters
+    const rows = Object.entries((await loadRegistry()).entries).filter(([, e]) => e.params.slice(96) === APP_PATH_HEX).sort(([, a], [, b]) => b.ts - a.ts);
     $("#list").innerHTML = rows.length
       ? `<ul>${rows.map(([id, e]) => `<li><a href="#/f/${esc(id)}.${esc(e.params)}">${esc(e.title)}</a> <small class="muted">${new Date(e.ts).toLocaleDateString()}</small></li>`).join("")}</ul>`
       : "<p>No public polls yet.</p>";
@@ -121,9 +187,20 @@ async function admin() {
     <p class="muted">Admin secret (hex) and the poll ids to hide, one per line. This replaces the whole blocklist.</p>
     <input id="sk" type="password" autocomplete="off" placeholder="Admin secret" />
     <textarea id="bl" rows="6"></textarea>
-    <p><button id="go" class="primary" type="button">Publish blocklist</button> <span id="msg"></span></p>`;
-  try { $<HTMLTextAreaElement>("#bl").value = (await loadRegistry()).blocked.list.join("\n"); }
-  catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
+    <p><button id="go" class="primary" type="button">Publish blocklist</button> <span id="msg"></span></p>
+    <h2>Listed polls</h2><div id="listed" class="muted">Loading…</div>`;
+  try {
+    const reg = await loadRegistry(), bl = $<HTMLTextAreaElement>("#bl");
+    bl.value = reg.blocked.list.join("\n");
+    const rows = Object.entries(reg.entries).sort(([, a], [, b]) => b.ts - a.ts);
+    $("#listed").innerHTML = rows.length ? `<ul>${rows.map(([id, e]) =>
+      `<li>${esc(e.title)} <small class="muted">${new Date(e.ts).toLocaleDateString()} · <code>${esc(id)}</code></small> <button class="hide" type="button" data-id="${esc(id)}">Hide</button></li>`).join("")}</ul>` : "No polls listed.";
+    // adds the id to the blocklist above; nothing is sent until "Publish blocklist"
+    app.querySelectorAll<HTMLButtonElement>(".hide").forEach((b) => (b.onclick = () => {
+      if (!bl.value.split("\n").includes(b.dataset.id!)) bl.value = [bl.value.trim(), b.dataset.id].filter(Boolean).join("\n");
+      b.disabled = true;
+    }));
+  } catch (e) { $("#msg").textContent = `Could not load the directory: ${e}`; }
   $("#go").onclick = async () => {
     const list = $<HTMLTextAreaElement>("#bl").value.split("\n").map((l) => l.trim()).filter(Boolean);
     $("#msg").textContent = "Sending...";
@@ -162,21 +239,26 @@ async function form(instance: string, params: string, invite?: string) {
 
   const link = pageUrl(`#/f/${instance}.${params}`);
   const invited = !schema.allowed || schema.allowed.includes(me.pk);
+  const ante = await needsAnte(instance, params, schema);
+  // owner = the whoiam persona in the parameters (polls from before personas carry no app path and no owner tools)
+  const owner = params.length > 96 ? (await session().catch(() => null))?.persona === params.slice(0, 64) : false;
   let savedInvites: string[] = [];
   try { savedInvites = JSON.parse((await storeGet(`inv:${instance}`)) ?? "[]"); } catch { /* unreadable: no saved invites */ }
   const draw = () => {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
     const n = Object.keys(st.responses).length;
-    const own = me.pk === params.slice(0, 64);
+    const own = owner;
     const intro = !schema.allowed
       ? `<p class="muted">${own ? "You are the owner. " : ""}Link to share: <input readonly value="${esc(link)}" onfocus="this.select()" /></p>` +
+        (ante ? `<p class="muted">Against spam, your first answer asks your Freenet node for a few seconds of proof of work (<a href="https://github.com/soudasuwa/ante" target="_blank" rel="noopener noreferrer">ante</a>). Changing it later needs none.</p>` : "") +
         (own ? `<p><button id="list-btn" type="button">List in the public directory</button> <span id="list-msg" class="muted">Public and permanent: anyone can see the title.</span></p>` : "")
       : `<p class="muted">${own ? `You are the owner. Invite-only poll: ${schema.allowed.length} invites.` : invited ? "You have a personal invite: keep this link to change your answer later." : "Invite-only poll: you need your personal link to answer."}</p>` +
         (own && savedInvites.length ? `<details><summary>Invite links (${savedInvites.length})</summary><textarea readonly rows="6" onfocus="this.select()">${esc(inviteLinks(`#/f/${instance}.${params}`, savedInvites).join("\n"))}</textarea></details>` : "");
     app.innerHTML = `
       <p><a href="#/">← New poll</a></p>
       <h1>${esc(schema.title)}</h1>
+      ${params.length > 96 ? `<p class="muted">by the Viso persona <code>${esc(personaName(params.slice(0, 64)))}</code></p>` : ""}
       ${own ? `<p><button id="ren" type="button">Rename</button> <span id="ren-msg" class="muted"></span></p>` : ""}
       ${intro}
       ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
@@ -184,16 +266,16 @@ async function form(instance: string, params: string, invite?: string) {
         ${schema.questions.map((q) => `
           <fieldset><legend>${esc(q.text)}${q.required ? " *" : ""}</legend>
           ${q.kind === "text"
-            ? `<textarea name="${q.id}" maxlength="2000">${esc(String(prev[q.id] ?? ""))}</textarea>`
+            ? `<textarea name="${esc(q.id)}" maxlength="2000">${esc(String(prev[q.id] ?? ""))}</textarea>`
             : q.kind === "avail"
             ? q.options.map((o, i) => {
                 const cur = ((prev[q.id] as number[]) ?? [])[i] ?? 0;
-                return `<label class="slot"><span>${esc(o)}</span><select name="${q.id}">${([[1, "Yes"], [2, "Maybe"], [0, "No"]] as const).map(([v, t]) =>
+                return `<label class="slot"><span>${esc(o)}</span><select name="${esc(q.id)}">${([[1, "Yes"], [2, "Maybe"], [0, "No"]] as const).map(([v, t]) =>
                   `<option value="${v}" ${cur === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>`;
               }).join("")
             : q.options.map((o, i) => {
                 const on = q.kind === "multi" ? ((prev[q.id] as number[]) ?? []).includes(i) : prev[q.id] === i;
-                return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${q.id}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
+                return `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${esc(q.id)}" value="${i}" ${on ? "checked" : ""}/> ${esc(o)}</label>`;
               }).join("")}
           </fieldset>`).join("")}
         <button class="primary">${mine ? "Update answer" : "Submit"}</button> <span id="msg"></span>
@@ -225,8 +307,14 @@ async function form(instance: string, params: string, invite?: string) {
         else if (v.length) a[q.id] = +v[0];
         if (q.required && !(q.id in a)) return void ($("#msg").textContent = `Missing: ${q.text}`);
       }
-      $("#msg").textContent = "Sending...";
-      try { await sendResponse(instance, me.pk, await signAnswers(me, params, a)); await refresh(); }
+      const say = (t: string) => ($("#msg").textContent = t);
+      try {
+        const r = await signAnswers(me, params, a);
+        if (ante) r.ante = st.responses[me.pk]?.ante || (await voteProof(params, me.pk, say));
+        say("Sending...");
+        await sendResponse(instance, me.pk, r);
+        await refresh();
+      }
       catch (err) { $("#msg").textContent = /timeout/i.test(String(err)) ? "The node did not accept the answer (invite-only poll: you need your personal link)." : `Errore: ${err}`; }
     };
   };
@@ -247,7 +335,8 @@ async function form(instance: string, params: string, invite?: string) {
         `<b>${yes[i]} yes${maybe[i] ? ` · ${maybe[i]} maybe` : ""}</b></div>`).join("");
     }
     const counts = q.options.map(() => 0);
-    all.forEach((v) => ([] as number[]).concat(v as number | number[]).forEach((i) => counts[i]++));
+    // a set: the contract accepts [0,0,0], which must still count as one vote
+    all.forEach((v) => new Set(([] as number[]).concat(v as number | number[])).forEach((i) => counts[i]++));
     const max = Math.max(1, ...counts);
     return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
       `<div class="bar"><span>${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${counts[i]}</b></div>`).join("");

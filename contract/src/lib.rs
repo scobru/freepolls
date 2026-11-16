@@ -1,24 +1,35 @@
 //! Form/poll contract. One contract instance per poll.
-//! Parameters = owner ed25519 pubkey (32 bytes) || random salt. The salt makes every poll address unique,
-//! even for the same owner; all signed messages are bound to the full parameters.
+//! Parameters = owner (a whoiam persona, ed25519 pubkey, 32 bytes) || random salt (16 bytes) || app path
+//! (`/v1/contract/web/<FreePolls id>/`). The salt makes every poll address unique, even for the same owner;
+//! all signed messages are bound to the full parameters. The schema is signed by an app key the persona
+//! delegated for that app path (see `whoiam-delegation`) and carries the delegation.
 //! State is JSON. Schema and answers travel as the exact signed strings, so no canonicalization needed.
+//! Open polls are rate-limited by ante (github.com/soudasuwa/ante): each respondent carries a proof of work signed
+//! by their ante identity, bound to this poll and respondent key, and one ante identity counts as one respondent.
+use ante_core::AnteProof;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use whoiam_delegation::{check, Cert};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Response {
     pub ts: u64,
     pub answers_json: String,
     pub sig: String, // hex
+    /// Open polls only: hex of the CBOR `AnteProof` for `vote_purpose`. Kept across answer updates (no new work).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ante: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct FormState {
     pub schema_json: String,
-    pub schema_sig: String, // hex
+    pub schema_sig: String, // hex, by the owner's delegated app key
+    #[serde(default)]
+    pub schema_cert: Option<Cert>, // the owner's delegation to that key
     pub responses: BTreeMap<String, Response>, // respondent pubkey hex -> response
 }
 
@@ -32,7 +43,7 @@ pub struct Summary {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Delta {
-    pub schema: Option<(String, String)>, // (schema_json, sig)
+    pub schema: Option<(String, String, Cert)>, // (schema_json, sig, delegation)
     pub responses: BTreeMap<String, Response>,
 }
 
@@ -48,6 +59,7 @@ struct Schema {
 }
 
 const MAX_INVITES: usize = 1000;
+pub const MIN_BITS: u32 = 18; // must match VOTE_BITS in ui/src/ante.ts
 
 #[derive(Deserialize)]
 struct Question {
@@ -75,9 +87,11 @@ fn verify(k: &VerifyingKey, msg: &[u8], sig_hex: &str) -> R<()> {
     k.verify(msg, &sig).map_err(|_| "bad signature".to_string())
 }
 
-fn parse_schema(params: &str, schema_json: &str, sig: &str) -> R<Schema> {
-    let owner = params.get(..64).ok_or("params too short")?;
-    verify(&key(owner)?, format!("fps1|{params}|{schema_json}").as_bytes(), sig)?;
+fn parse_schema(params: &str, schema_json: &str, sig: &str, cert: Option<&Cert>) -> R<Schema> {
+    let raw = hex::decode(params).map_err(|e| e.to_string())?;
+    let app = std::str::from_utf8(raw.get(48..).ok_or("params too short")?).map_err(|e| e.to_string())?;
+    let app_key = check(&params[..64], app, cert.ok_or("schema without delegation")?)?;
+    verify(&app_key, format!("fps1|{params}|{schema_json}").as_bytes(), sig)?;
     let schema: Schema = serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
     if let Some(a) = &schema.allowed {
         if a.len() > MAX_INVITES {
@@ -135,41 +149,82 @@ fn check_answers(schema: &Schema, answers_json: &str) -> R<()> {
     Ok(())
 }
 
-fn check_response(params: &str, schema: &Schema, who: &str, r: &Response) -> R<()> {
+/// What a respondent's ante proof commits to: this poll and this respondent key, not the answers.
+/// The params are hashed: in full (with the app path) they exceed ante's 256-byte purpose limit.
+pub fn vote_purpose(params: &str, who: &str) -> String {
+    format!("freepolls:vote:v2:{}:{who}", blake3::hash(params.as_bytes()).to_hex())
+}
+
+/// Checks a response; for an open poll, returns the respondent's ante identity (hex).
+fn check_response(params: &str, schema: &Schema, who: &str, r: &Response) -> R<Option<String>> {
     if schema.allowed.as_ref().is_some_and(|a| !a.iter().any(|k| k == who)) {
         return Err("respondent not invited".into());
     }
     let msg = format!("fpr1|{params}|{who}|{}|{}", r.ts, r.answers_json);
     verify(&key(who)?, msg.as_bytes(), &r.sig)?;
-    check_answers(schema, &r.answers_json)
+    check_answers(schema, &r.answers_json)?;
+    if schema.allowed.is_some() {
+        return Ok(None); // invite-only: the invite list already limits who answers
+    }
+    let proof: AnteProof = ante_core::from_cbor(&hex::decode(&r.ante).map_err(|e| e.to_string())?)?;
+    if proof.purpose != vote_purpose(params, who) {
+        return Err("ante proof is for another poll or respondent".into());
+    }
+    proof.verify(MIN_BITS).map_err(|e| e.to_string())?;
+    Ok(Some(hex::encode(proof.identity_vk)))
+}
+
+/// The respondent (other than `who`) already counted for this ante identity, if any. State is already valid,
+/// so its proofs are only decoded here, not verified again.
+fn holder<'a>(s: &'a FormState, who: &str, ante: &str) -> Option<&'a String> {
+    let id = |r: &Response| ante_core::from_cbor::<AnteProof>(&hex::decode(&r.ante).ok()?).ok().map(|p| hex::encode(p.identity_vk));
+    s.responses.iter().find(|(k, r)| *k != who && id(r).as_deref() == Some(ante)).map(|(k, _)| k)
 }
 
 pub fn validate(params: &str, s: &FormState) -> R<()> {
-    let schema = parse_schema(params, &s.schema_json, &s.schema_sig)?;
-    s.responses.iter().try_for_each(|(who, r)| check_response(params, &schema, who, r))
+    let schema = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
+    let mut seen = std::collections::BTreeSet::new();
+    for (who, r) in &s.responses {
+        if let Some(a) = check_response(params, &schema, who, r)? {
+            if !seen.insert(a) {
+                return Err("two respondents with one ante identity".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Merge a delta into state: schema is set once, per-respondent last-write-wins by ts.
 pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
-    if let Some((json, sig)) = d.schema {
-        let new = parse_schema(params, &json, &sig)?;
+    if let Some((json, sig, cert)) = d.schema {
+        let new = parse_schema(params, &json, &sig, Some(&cert))?;
         if s.schema_json.is_empty() {
             s.schema_json = json;
             s.schema_sig = sig;
+            s.schema_cert = Some(cert);
         } else if new.rev > rev_of(&s.schema_json) {
             if !same_body(&s.schema_json, &json) {
                 return Err("only the title can change".into());
             }
             s.schema_json = json;
             s.schema_sig = sig;
+            s.schema_cert = Some(cert);
         }
     }
-    let schema = parse_schema(params, &s.schema_json, &s.schema_sig)?;
+    let schema = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
     for (who, r) in d.responses {
         if s.responses.get(&who).is_some_and(|old| old.ts >= r.ts) {
             continue;
         }
-        check_response(params, &schema, &who, &r)?;
+        if let Some(a) = check_response(params, &schema, &who, &r)? {
+            // One respondent per ante identity; the smallest key wins, so every merge order converges.
+            if let Some(other) = holder(s, &who, &a).cloned() {
+                if other < who {
+                    continue;
+                }
+                s.responses.remove(&other);
+            }
+        }
         s.responses.insert(who, r);
     }
     Ok(())
@@ -186,7 +241,8 @@ pub fn summarize(s: &FormState) -> Summary {
 pub fn delta(s: &FormState, sum: &Summary) -> Delta {
     Delta {
         schema: (!s.schema_json.is_empty() && (!sum.has_schema || rev_of(&s.schema_json) > sum.schema_rev))
-            .then(|| (s.schema_json.clone(), s.schema_sig.clone())),
+            .then(|| s.schema_cert.clone().map(|c| (s.schema_json.clone(), s.schema_sig.clone(), c)))
+            .flatten(),
         responses: s
             .responses
             .iter()
@@ -243,7 +299,7 @@ impl ContractInterface for Contract {
                 UpdateData::State(st) => {
                     let other: FormState = de(st.as_ref())?;
                     Delta {
-                        schema: (!other.schema_json.is_empty()).then(|| (other.schema_json, other.schema_sig)),
+                        schema: other.schema_cert.filter(|_| !other.schema_json.is_empty()).map(|c| (other.schema_json, other.schema_sig, c)),
                         responses: other.responses,
                     }
                 }
@@ -276,6 +332,24 @@ impl ContractInterface for Contract {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use whoiam_delegation::connect_message;
+
+    const APP: &str = "/v1/contract/web/Polls1/";
+    /// Poll parameters for owner `o`: persona || salt || app path.
+    fn params(o: &SigningKey, salt: u8) -> String {
+        format!("{}{}{}", pk(o), hex::encode([salt; 16]), hex::encode(APP))
+    }
+    /// The owner's schema, signed by an app key it delegated for `app`.
+    fn schema_for(o: &SigningKey, params: &str, json: &str, app: &str) -> (String, String, Cert) {
+        let app_key = sk(100);
+        let (base, challenge) = (format!("http://127.0.0.1:7509{app}"), format!("wd1.{}.n1", pk(&app_key)));
+        let csig = o.sign(&connect_message(o.verifying_key().as_bytes(), &base, &challenge, 1));
+        let cert = Cert { base, challenge, ts: 1, sig: hex::encode(csig.to_bytes()) };
+        (json.into(), hex::encode(app_key.sign(format!("fps1|{params}|{json}").as_bytes()).to_bytes()), cert)
+    }
+    fn schema(o: &SigningKey, params: &str, json: &str) -> (String, String, Cert) {
+        schema_for(o, params, json, APP)
+    }
 
     fn sk(n: u8) -> SigningKey {
         SigningKey::from_bytes(&[n; 32])
@@ -285,9 +359,74 @@ mod tests {
     }
     const SCHEMA: &str = r#"{"questions":[{"id":"q1","kind":"single","options":["a","b"],"required":true}]}"#;
 
-    fn resp(params: &str, who: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
+    /// A response with an ante proof from the ante identity `ante` (ignored by invite-only polls).
+    fn resp_by(params: &str, who: &SigningKey, ante: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
         let msg = format!("fpr1|{params}|{}|{ts}|{ans}", pk(who));
-        (pk(who), Response { ts, answers_json: ans.into(), sig: hex::encode(who.sign(msg.as_bytes()).to_bytes()) })
+        let r = Response { ts, answers_json: ans.into(), sig: hex::encode(who.sign(msg.as_bytes()).to_bytes()), ante: proof(params, &pk(who), ante) };
+        (pk(who), r)
+    }
+    fn resp(params: &str, who: &SigningKey, ts: u64, ans: &str) -> (String, Response) {
+        resp_by(params, who, who, ts, ans)
+    }
+
+    /// Real 18-bit proofs are slow in debug builds: grind each (purpose, identity) once.
+    fn proof(params: &str, who: &str, ante: &SigningKey) -> String {
+        static CACHE: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
+        let (p, vk) = (vote_purpose(params, who), ante.verifying_key().to_bytes());
+        CACHE.lock().unwrap().entry(format!("{p}|{}", hex::encode(vk))).or_insert_with(|| {
+            let nonce = ante_core::pow::grind(&p, &vk, MIN_BITS).unwrap();
+            hex::encode(ante_core::to_cbor(&AnteProof::create(ante, p.clone(), nonce, 1)))
+        }).clone()
+    }
+
+    fn open_poll(o: &SigningKey) -> (String, FormState) {
+        let op = params(o, 0xaa);
+        let mut s = FormState::default();
+        apply(&op, &mut s, Delta { schema: Some(schema(o, &op, SCHEMA)), ..Default::default() }).unwrap();
+        (op, s)
+    }
+
+    /// The proof printed by ui/src/ante.test.ts (same purpose, key 7s, nonce ground there): the contract accepts it.
+    #[test]
+    fn a_proof_made_by_the_ui_code_verifies() {
+        let ui = "a56b6964656e746974795f766b982018ea184a186c186318e2189c18520a18be18f51850187b13182e18c518f918951847187618ae18be18be187b18921842181e18ea186914184618d2182c67707572706f7365789366726565706f6c6c733a766f74653a76323a326532653038623539663035613733363537363237303865333364383339626566343936633439633135313265353763363766393938323939363239333631313a63646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364656e6f6e636519f8af6274731b0000018bcfe56800697369676e6174757265984018c818f118ed18a4184d181e18e418d80418c2186618e7183618e6181b1856151830186d189b18c4188e18ac18fe1829184018e418e1061825183a184a184c18e618cf1824189718aa18e018d418771853188c08183d18b218f018e118fc186f182b18e4186e18f918f5187f18da1843188d186418f61855183d0c";
+        let p: AnteProof = ante_core::from_cbor(&hex::decode(ui).unwrap()).unwrap();
+        let params = "ab".repeat(48) + &hex::encode("/v1/contract/web/9x8dZTsykTPC8n8LxDgwdvAocnqGaw8VxyzAbCdEfGhJ/");
+        assert_eq!(p.purpose, vote_purpose(&params, &"cd".repeat(32)));
+        assert!(p.purpose.len() <= 256); // ante's purpose limit
+        p.verify(MIN_BITS).unwrap();
+    }
+
+    #[test]
+    fn open_polls_need_ante() {
+        let (op, mut s) = open_poll(&sk(1));
+        // no proof, or a proof made for another respondent, is refused
+        let (k, mut bare) = resp(&op, &sk(2), 1, r#"{"q1":0}"#);
+        bare.ante.clear();
+        assert!(apply(&op, &mut s, Delta { responses: [(k.clone(), bare)].into(), ..Default::default() }).is_err());
+        let (_, mut stolen) = resp(&op, &sk(2), 1, r#"{"q1":0}"#);
+        stolen.ante = proof(&op, &pk(&sk(3)), &sk(2));
+        assert!(apply(&op, &mut s, Delta { responses: [(k, stolen)].into(), ..Default::default() }).is_err());
+
+        // one ante identity = one respondent, whatever the merge order: the smaller respondent key wins
+        let a = sk(9);
+        let (k2, r2) = resp_by(&op, &sk(2), &a, 1, r#"{"q1":0}"#);
+        let (k3, r3) = resp_by(&op, &sk(3), &a, 1, r#"{"q1":1}"#);
+        let (mut x, mut y) = (s.clone(), s.clone());
+        apply(&op, &mut x, Delta { responses: [(k2.clone(), r2.clone())].into(), ..Default::default() }).unwrap();
+        apply(&op, &mut x, Delta { responses: [(k3.clone(), r3.clone())].into(), ..Default::default() }).unwrap();
+        apply(&op, &mut y, Delta { responses: [(k3, r3)].into(), ..Default::default() }).unwrap();
+        apply(&op, &mut y, Delta { responses: [(k2, r2)].into(), ..Default::default() }).unwrap();
+        assert_eq!(x, y);
+        assert_eq!(x.responses.len(), 1);
+        validate(&op, &x).unwrap();
+
+        // changing the answer reuses the proof
+        let k = x.responses.keys().next().unwrap().clone();
+        let who = if k == pk(&sk(2)) { sk(2) } else { sk(3) };
+        let (_, newer) = resp_by(&op, &who, &a, 5, r#"{"q1":1}"#);
+        apply(&op, &mut x, Delta { responses: [(k.clone(), newer)].into(), ..Default::default() }).unwrap();
+        assert_eq!(x.responses[&k].ts, 5);
     }
 
     #[test]
@@ -307,51 +446,54 @@ mod tests {
     #[test]
     fn invite_only() {
         let o = sk(1);
-        let op = pk(&o);
+        let op = params(&o, 0xaa);
         let (invited, stranger) = (sk(2), sk(3));
         let schema = format!(
             r#"{{"questions":[{{"id":"q1","kind":"single","options":["a","b"],"required":true}}],"allowed":["{}"]}}"#,
             pk(&invited)
         );
-        let sig = hex::encode(o.sign(format!("fps1|{op}|{schema}").as_bytes()).to_bytes());
         let mut s = FormState::default();
         let (k, r) = resp(&op, &invited, 1, r#"{"q1":0}"#);
-        apply(&op, &mut s, Delta { schema: Some((schema, sig)), responses: [(k, r)].into() }).unwrap();
+        apply(&op, &mut s, Delta { schema: Some(self::schema(&o, &op, &schema)), responses: [(k, r)].into() }).unwrap();
         validate(&op, &s).unwrap();
         let (k2, r2) = resp(&op, &stranger, 1, r#"{"q1":0}"#);
         assert!(apply(&op, &mut s, Delta { responses: [(k2, r2)].into(), ..Default::default() }).is_err());
 
         // malformed invite key rejected at schema level
         let bad = r#"{"questions":[],"allowed":["zz"]}"#;
-        let bad_sig = hex::encode(o.sign(format!("fps1|{op}|{bad}").as_bytes()).to_bytes());
-        assert!(parse_schema(&op, bad, &bad_sig).is_err());
+        let (_, bad_sig, cert) = self::schema(&o, &op, bad);
+        assert!(parse_schema(&op, bad, &bad_sig, Some(&cert)).is_err());
     }
 
     #[test]
     fn salted_params_bind_everything() {
         let o = sk(1);
-        let params_a = format!("{}{}", pk(&o), "aa".repeat(16));
-        let params_b = format!("{}{}", pk(&o), "bb".repeat(16));
-        let sig_a = hex::encode(o.sign(format!("fps1|{params_a}|{SCHEMA}").as_bytes()).to_bytes());
+        let (params_a, params_b) = (params(&o, 0xaa), params(&o, 0xbb));
+        let (_, sig_a, cert) = schema(&o, &params_a, SCHEMA);
         // valid for its own params, rejected under the same owner's other poll (no cloning of signed schemas)
-        parse_schema(&params_a, SCHEMA, &sig_a).unwrap();
-        assert!(parse_schema(&params_b, SCHEMA, &sig_a).is_err());
+        parse_schema(&params_a, SCHEMA, &sig_a, Some(&cert)).unwrap();
+        assert!(parse_schema(&params_b, SCHEMA, &sig_a, Some(&cert)).is_err());
+        // no delegation, another persona, or a delegation for another app: refused
+        assert!(parse_schema(&params_a, SCHEMA, &sig_a, None).is_err());
+        let stranger = params(&sk(7), 0xaa);
+        assert!(parse_schema(&stranger, SCHEMA, &sig_a, Some(&cert)).is_err());
+        let (_, sig_x, other_app) = schema_for(&o, &params_a, SCHEMA, "/v1/contract/web/Other/");
+        assert!(parse_schema(&params_a, SCHEMA, &sig_x, Some(&other_app)).is_err());
         // answers are bound to the poll too
         let mut s = FormState::default();
-        let d = Delta { schema: Some((SCHEMA.into(), sig_a)), ..Default::default() };
+        let d = Delta { schema: Some((SCHEMA.into(), sig_a, cert)), ..Default::default() };
         apply(&params_a, &mut s, d).unwrap();
         let (k, r) = resp(&params_b, &sk(2), 1, r#"{"q1":0}"#);
         assert!(apply(&params_a, &mut s, Delta { responses: [(k, r)].into(), ..Default::default() }).is_err());
-        assert!(parse_schema("abcd", SCHEMA, "00").is_err()); // too short
+        assert!(parse_schema("abcd", SCHEMA, "00", None).is_err()); // too short
     }
 
     #[test]
     fn merge_flow() {
         let o = sk(1);
-        let op = pk(&o);
-        let sig = hex::encode(o.sign(format!("fps1|{op}|{SCHEMA}").as_bytes()).to_bytes());
+        let op = params(&o, 0xaa);
         let mut s = FormState::default();
-        let mut d = Delta { schema: Some((SCHEMA.into(), sig)), ..Default::default() };
+        let mut d = Delta { schema: Some(schema(&o, &op, SCHEMA)), ..Default::default() };
         let (k, r) = resp(&op, &sk(2), 1, r#"{"q1":0}"#);
         d.responses.insert(k.clone(), r);
         apply(&op, &mut s, d).unwrap();
@@ -371,7 +513,7 @@ mod tests {
         let (_, mut forged) = resp(&op, &sk(3), 1, r#"{"q1":0}"#);
         forged.ts = 2;
         assert!(apply(&op, &mut s, Delta { responses: [(k3, forged)].into(), ..Default::default() }).is_err());
-        let (k4, other_form) = resp(&pk(&sk(9)), &sk(4), 1, r#"{"q1":0}"#);
+        let (k4, other_form) = resp(&params(&sk(9), 1), &sk(4), 1, r#"{"q1":0}"#);
         assert!(apply(&op, &mut s, Delta { responses: [(k4, other_form)].into(), ..Default::default() }).is_err());
 
         // delta vs summary
@@ -383,14 +525,13 @@ mod tests {
     #[test]
     fn title_rename() {
         let o = sk(1);
-        let op = pk(&o);
-        let sign = |j: &str| hex::encode(o.sign(format!("fps1|{op}|{j}").as_bytes()).to_bytes());
+        let op = params(&o, 0xaa);
         let q = r#""questions":[{"id":"q1","kind":"single","options":["a","b"],"required":true}]"#;
         let v0 = format!(r#"{{"title":"old",{q}}}"#);
         let v1 = format!(r#"{{"title":"new","rev":1,{q}}}"#);
         let v2 = format!(r#"{{"title":"newer","rev":2,{q}}}"#);
         let changed = format!(r#"{{"title":"x","rev":3,"questions":[]}}"#);
-        let d = |j: &str| Delta { schema: Some((j.into(), sign(j))), ..Default::default() };
+        let d = |j: &str| Delta { schema: Some(schema(&o, &op, j)), ..Default::default() };
 
         let mut s = FormState::default();
         apply(&op, &mut s, d(&v0)).unwrap();
@@ -403,8 +544,11 @@ mod tests {
         validate(&op, &s).unwrap(); // existing answers still valid
 
         assert!(apply(&op, &mut s, d(&changed)).is_err()); // body is fixed
-        let forged = Delta { schema: Some((format!(r#"{{"title":"evil","rev":9,{q}}}"#), sign(&v1))), ..Default::default() };
-        assert!(apply(&op, &mut s, forged).is_err()); // not signed by the owner
+
+        // forged: a real signature (over v1), replayed under a different, tampered body
+        let (_, sig_v1, cert_v1) = schema(&o, &op, &v1);
+        let forged = Delta { schema: Some((format!(r#"{{"title":"evil","rev":9,{q}}}"#), sig_v1, cert_v1)), ..Default::default() };
+        assert!(apply(&op, &mut s, forged).is_err()); // signature does not match this body
 
         // peers behind on rev get the new schema in the delta
         let behind = Summary { has_schema: true, schema_rev: 1, ..Default::default() };

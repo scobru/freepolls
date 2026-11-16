@@ -8,6 +8,7 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+whoiam-delegation = { git = "https://github.com/scobru/freenames", rev = "d6dc35f8d0d85c0d95430c5da3c3eeb8e9ee9120" } # the poll owner is a whoiam persona
 freenet-stdlib = { version = "0.8", features = ["contract"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
