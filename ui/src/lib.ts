@@ -24,7 +24,7 @@ import { asBytes, cborDecode, cborEncode, enumVariant, mapGet, type CborValue } 
 // ---- types mirroring contract/src/lib.rs ----
 export type Kind = "single" | "multi" | "avail" | "text"; // avail: per-slot 0 = no, 1 = yes, 2 = maybe
 export interface Question { id: string; kind: Kind; text: string; options: string[]; required: boolean }
-export interface Schema { title: string; questions: Question[]; allowed?: string[] } // allowed = invited pubkeys (hex), absent = open poll
+export interface Schema { title: string; questions: Question[]; allowed?: string[]; rev?: number } // allowed = invited pubkeys (hex), absent = open poll; rev: bumped by the owner on every text edit
 export interface Response { ts: number; answers_json: string; sig: string; ante?: string } // ante: open polls, hex CBOR proof
 export interface Cert { base: string; challenge: string; ts: number; sig: string } // a whoiam delegation, see below
 export interface Resolution { outcome_json: string; ts: number; sig: string; cert: Cert } // outcome_json: same shape as a Response's answers_json
@@ -204,6 +204,14 @@ export async function resolve(params: string, outcome: Answers): Promise<Resolut
   const ts = Date.now(), outcome_json = JSON.stringify(outcome);
   return { outcome_json, ts, sig: await me.sign(`fpz1|${params}|${outcome_json}|${ts}`), cert: me.cert };
 }
+/** Sign an edited schema: same questions/options shape as the live one, only wording changed, `rev` bumped.
+ *  Owner only (the contract checks the signer against the poll's fixed owner persona). */
+export async function editSchema(params: string, schema: Schema): Promise<{ schema_json: string; schema_sig: string; schema_cert: Cert }> {
+  const me = await requireSession();
+  const schema_json = JSON.stringify(schema);
+  return { schema_json, schema_sig: await me.sign(`fps1|${params}|${schema_json}`), schema_cert: me.cert };
+}
+
 export { shares, isCorrect, donutArcs } from "./sentiment.ts";
 
 // ---- open-poll anti-spam: ante (github.com/soudasuwa/ante), as in FreeTunes reports ----
@@ -304,6 +312,8 @@ export const sendResponse = (instance: string, pk: string, r: Response) =>
   sendDelta(instance, { schema: null, responses: { [pk]: r } });
 export const sendResolution = (instance: string, resolution: Resolution) =>
   sendDelta(instance, { schema: null, resolution, responses: {} });
+export const sendSchemaEdit = (instance: string, schema_json: string, schema_sig: string, schema_cert: Cert) =>
+  sendDelta(instance, { schema: [schema_json, schema_sig, schema_cert], resolution: null, responses: {} });
 
 /** Contract code + key. Instance id = blake3(blake3(wasm) || params), same as freenet-stdlib. */
 async function build(wasm: string, params: Uint8Array) {

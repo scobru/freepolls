@@ -1,7 +1,7 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockPolls, createLocalIdentity, donutArcs, finishSignIn, localIdentityKey, identity, identityFrom, isCorrect, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
-  personaName, publish, resolve, sendResolution, sendResponse, session, shares, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
+  APP_PATH_HEX, blockPolls, createLocalIdentity, donutArcs, editSchema, finishSignIn, localIdentityKey, identity, identityFrom, isCorrect, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
+  personaName, publish, resolve, sendResolution, sendResponse, sendSchemaEdit, session, shares, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -265,6 +265,17 @@ async function form(instance: string, params: string, invite?: string) {
       <h1>${esc(schema.title)}</h1>
       ${params.length > 96 ? `<p class="muted">by the Viso persona <code>${esc(personaName(params.slice(0, 64)))}</code></p>` : ""}
       ${intro}
+      ${own ? `<details class="resolve"><summary>Edit poll text</summary>
+        <form id="ef">
+          <label>Title<input name="title" value="${esc(schema.title)}" maxlength="200" required/></label>
+          ${schema.questions.map((q, qi) => `
+            <fieldset><legend>Question ${qi + 1}</legend>
+              <label>Text<input name="qtext:${esc(q.id)}" value="${esc(q.text)}" maxlength="300" required/></label>
+              ${q.options.map((o, i) => `<label>Option ${i + 1}<input name="qopt:${esc(q.id)}:${i}" value="${esc(o)}" maxlength="120" required/></label>`).join("")}
+            </fieldset>`).join("")}
+          <button class="primary">Save changes</button> <span id="ef-msg" class="muted"></span>
+        </form>
+      </details>` : ""}
       ${me.persisted || !invited ? "" : `<p class="muted">⚠ Temporary identity: you can update your answer until you close the page; after that you will count as a new respondent.</p>`}
       <form id="f" ${invited ? "" : "hidden"}>
         ${schema.questions.map((q) => `
@@ -316,6 +327,28 @@ async function form(instance: string, params: string, invite?: string) {
       $("#res-msg").textContent = "Resolving...";
       try { await sendResolution(instance, await resolve(params, out)); await refresh(); }
       catch (err) { $("#res-msg").textContent = `Error: ${err}`; }
+    };
+    const ef = app.querySelector<HTMLFormElement>("#ef");
+    if (ef) ef.onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target as HTMLFormElement);
+      const edited: Schema = {
+        ...schema,
+        title: String(fd.get("title") ?? schema.title).trim(),
+        questions: schema.questions.map((q) => ({
+          ...q,
+          text: String(fd.get(`qtext:${q.id}`) ?? q.text).trim(),
+          options: q.options.map((o, i) => String(fd.get(`qopt:${q.id}:${i}`) ?? o).trim()),
+        })),
+        rev: (schema.rev ?? 0) + 1,
+      };
+      if (!edited.title || edited.questions.some((q) => !q.text || q.options.some((o) => !o))) return void ($("#ef-msg").textContent = "Nothing can be left blank.");
+      $("#ef-msg").textContent = "Saving...";
+      try {
+        const { schema_json, schema_sig, schema_cert } = await editSchema(params, edited);
+        await sendSchemaEdit(instance, schema_json, schema_sig, schema_cert);
+        await refresh();
+      } catch (err) { $("#ef-msg").textContent = `Error: ${err}`; }
     };
     const listBtn = app.querySelector<HTMLButtonElement>("#list-btn");
     if (listBtn) listBtn.onclick = async () => {
@@ -383,6 +416,7 @@ async function form(instance: string, params: string, invite?: string) {
     // skip redraw while the user is typing in the form
     const typing = app.contains(document.activeElement) && document.activeElement instanceof HTMLTextAreaElement;
     st = await loadState(instance);
+    schema = JSON.parse(st.schema_json);
     if (!typing) draw();
   };
   onRemoteChange(() => void refresh()); // ponytail: refetch full state on notification; use deltas if responses get large

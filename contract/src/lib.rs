@@ -49,8 +49,15 @@ pub struct FormState {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Summary {
     pub has_schema: bool,
+    #[serde(default)]
+    pub schema_rev: u32,
     pub has_resolution: bool,
     pub responses: BTreeMap<String, u64>, // pubkey -> ts
+}
+
+/// The schema's `rev`, ignoring signature/delegation (a sync hint only; `apply` re-verifies everything).
+fn schema_rev(s: &FormState) -> u32 {
+    serde_json::from_str::<Schema>(&s.schema_json).map(|sc| sc.rev).unwrap_or(0)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -66,6 +73,18 @@ struct Schema {
     /// Invite-only poll: pubkeys (hex) allowed to answer. `None` = open poll.
     #[serde(default)]
     allowed: Option<Vec<String>>,
+    /// Bumped by the owner on every text edit (title/question/option wording). A higher rev replaces the
+    /// stored schema only if the shape below is unchanged, so existing responses stay interpretable.
+    #[serde(default)]
+    rev: u32,
+}
+
+/// Same questions (ids, kind, option count) and invite list: only wording (title, question text, option
+/// labels) may differ. Keeps past responses and any resolution valid across an edit.
+fn same_shape(a: &Schema, b: &Schema) -> bool {
+    a.allowed == b.allowed
+        && a.questions.len() == b.questions.len()
+        && a.questions.iter().zip(&b.questions).all(|(x, y)| x.id == y.id && x.kind == y.kind && x.options.len() == y.options.len())
 }
 
 const MAX_INVITES: usize = 1000;
@@ -207,6 +226,15 @@ pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
             s.schema_json = json;
             s.schema_sig = sig;
             s.schema_cert = Some(cert);
+        } else {
+            // a text edit: parse_schema already binds `cert` to this instance's one fixed owner (params[..64])
+            let current = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
+            let incoming = parse_schema(params, &json, &sig, Some(&cert))?;
+            if incoming.rev > current.rev && same_shape(&incoming, &current) {
+                s.schema_json = json;
+                s.schema_sig = sig;
+                s.schema_cert = Some(cert);
+            }
         }
     }
     let schema = parse_schema(params, &s.schema_json, &s.schema_sig, s.schema_cert.as_ref())?;
@@ -237,6 +265,7 @@ pub fn apply(params: &str, s: &mut FormState, d: Delta) -> R<()> {
 pub fn summarize(s: &FormState) -> Summary {
     Summary {
         has_schema: !s.schema_json.is_empty(),
+        schema_rev: schema_rev(s),
         has_resolution: s.resolution.is_some(),
         responses: s.responses.iter().map(|(k, r)| (k.clone(), r.ts)).collect(),
     }
@@ -244,7 +273,7 @@ pub fn summarize(s: &FormState) -> Summary {
 
 pub fn delta(s: &FormState, sum: &Summary) -> Delta {
     Delta {
-        schema: (!sum.has_schema && !s.schema_json.is_empty())
+        schema: (!s.schema_json.is_empty() && (!sum.has_schema || sum.schema_rev < schema_rev(s)))
             .then(|| s.schema_cert.clone().map(|c| (s.schema_json.clone(), s.schema_sig.clone(), c)))
             .flatten(),
         resolution: (!sum.has_resolution).then(|| s.resolution.clone()).flatten(),
@@ -449,6 +478,7 @@ mod tests {
         let schema = Schema {
             questions: vec![Question { id: "d".into(), kind: "avail".into(), options: vec!["mon".into(), "tue".into(), "wed".into()], required: true }],
             allowed: None,
+            rev: 0,
         };
         assert!(check_answers(&schema, r#"{"d":[1,0,2]}"#).is_ok());
         assert!(check_answers(&schema, r#"{"d":[1,0]}"#).is_err()); // wrong length
@@ -566,5 +596,34 @@ mod tests {
         // summary/delta round-trip
         assert!(summarize(&s).has_resolution);
         assert!(delta(&s, &summarize(&s)).resolution.is_none());
+    }
+
+    #[test]
+    fn owner_can_edit_schema_text_but_not_its_shape() {
+        let o = sk(1);
+        let (op, mut s) = open_poll(&o);
+
+        // a higher rev with the same shape (same ids/kind/option count) replaces the stored schema
+        const EDITED: &str = r#"{"questions":[{"id":"q1","kind":"single","options":["A","B"],"required":true}],"rev":1}"#;
+        apply(&op, &mut s, Delta { schema: Some(schema(&o, &op, EDITED)), ..Default::default() }).unwrap();
+        assert_eq!(s.schema_json, EDITED);
+        validate(&op, &s).unwrap();
+
+        // an equal or lower rev is ignored, even if well-formed and well-signed
+        const STALE: &str = r#"{"questions":[{"id":"q1","kind":"single","options":["C","D"],"required":true}],"rev":1}"#;
+        apply(&op, &mut s, Delta { schema: Some(schema(&o, &op, STALE)), ..Default::default() }).unwrap();
+        assert_eq!(s.schema_json, EDITED);
+
+        // a higher rev that changes the shape (one more option) is rejected: it would desync past responses
+        const RESHAPED: &str = r#"{"questions":[{"id":"q1","kind":"single","options":["A","B","C"],"required":true}],"rev":2}"#;
+        apply(&op, &mut s, Delta { schema: Some(schema(&o, &op, RESHAPED)), ..Default::default() }).unwrap();
+        assert_eq!(s.schema_json, EDITED);
+
+        // delta resends the schema to a peer summarizing an older rev
+        let mut behind = Summary::default();
+        behind.has_schema = true;
+        behind.schema_rev = 0;
+        assert!(delta(&s, &behind).schema.is_some());
+        assert!(delta(&s, &summarize(&s)).schema.is_none());
     }
 }
