@@ -204,7 +204,7 @@ export async function resolve(params: string, outcome: Answers): Promise<Resolut
   const ts = Date.now(), outcome_json = JSON.stringify(outcome);
   return { outcome_json, ts, sig: await me.sign(`fpz1|${params}|${outcome_json}|${ts}`), cert: me.cert };
 }
-export { shares, isCorrect } from "./sentiment.ts";
+export { shares, isCorrect, donutArcs } from "./sentiment.ts";
 
 // ---- open-poll anti-spam: ante (github.com/soudasuwa/ante), as in FreeTunes reports ----
 // The respondent's node asks for consent, the page grinds a few seconds of proof of work, the node signs it. The proof

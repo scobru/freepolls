@@ -1,6 +1,6 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockPolls, createLocalIdentity, finishSignIn, localIdentityKey, identity, identityFrom, isCorrect, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
+  APP_PATH_HEX, blockPolls, createLocalIdentity, donutArcs, finishSignIn, localIdentityKey, identity, identityFrom, isCorrect, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
   personaName, publish, resolve, sendResolution, sendResponse, session, shares, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
@@ -8,6 +8,7 @@ import {
 const app = document.getElementById("app")!;
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const $ = <T extends HTMLElement>(sel: string, root: ParentNode = app) => root.querySelector(sel) as T;
+const DONUT_COLORS = ["#2f6f5e", "#c9a227", "#6b5ca5", "#c4683d", "#3d7ec4", "#9c3d6e", "#5e8f3d", "#8a8a8a"];
 
 // route: #/ (builder)  |  #/f/<instanceB58>.<paramsHex>[/i/<inviteSecretHex>] (poll)
 function route() {
@@ -367,8 +368,15 @@ async function form(instance: string, params: string, invite?: string) {
     const max = Math.max(1, ...counts);
     const pct = shares(st.responses, q);
     const correctSet = st.resolution ? new Set(([] as number[]).concat((outcome[q.id] as number | number[]) ?? [])) : null;
-    return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
-      `<div class="bar${correctSet?.has(i) ? " correct" : ""}"><span>${correctSet?.has(i) ? "✓ " : ""}${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${pct[i].toFixed(0)}% · ${counts[i]}</b></div>`).join("");
+    const r = 40, arcs = donutArcs(pct, r);
+    const donut = `<svg class="donut" viewBox="0 0 100 100" width="84" height="84">` +
+      `<circle cx="50" cy="50" r="${r}" fill="none" stroke="var(--line)" stroke-width="16" />` +
+      q.options.map((_, i) => arcs[i].dasharray.startsWith("0 ") ? "" :
+        `<circle cx="50" cy="50" r="${r}" fill="none" stroke="${correctSet?.has(i) ? "#2e7d32" : DONUT_COLORS[i % DONUT_COLORS.length]}" stroke-width="16" stroke-dasharray="${arcs[i].dasharray}" stroke-dashoffset="${arcs[i].dashoffset}" transform="rotate(-90 50 50)" />`).join("") +
+      `</svg>`;
+    return `<h3>${esc(q.text)}</h3><div class="results-row">${donut}<div class="bars">` + q.options.map((o, i) =>
+      `<div class="bar${correctSet?.has(i) ? " correct" : ""}"><span><b class="dot" style="background:${DONUT_COLORS[i % DONUT_COLORS.length]}"></b>${correctSet?.has(i) ? "✓ " : ""}${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${pct[i].toFixed(0)}% · ${counts[i]}</b></div>`).join("") +
+      `</div></div>`;
   }).join("");
 
   const refresh = async () => {
