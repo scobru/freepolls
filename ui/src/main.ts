@@ -1,7 +1,7 @@
 import "./style.css";
 import {
-  APP_PATH_HEX, blockPolls, createLocalIdentity, finishSignIn, localIdentityKey, identity, identityFrom, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
-  personaName, publish, sendResponse, session, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
+  APP_PATH_HEX, blockPolls, createLocalIdentity, finishSignIn, localIdentityKey, identity, identityFrom, isCorrect, listPoll, loadRegistry, loadState, needsAnte, newInvites, officialViso, onRemoteChange,
+  personaName, publish, resolve, sendResolution, sendResponse, session, shares, signAnswers, signOut, startSignIn, storeGet, storePut, voteProof, watch, type Session,
   type Answers, type FormState, type Kind, type Question, type Schema,
 } from "./lib";
 
@@ -244,6 +244,10 @@ async function form(instance: string, params: string, invite?: string) {
   const owner = params.length > 96 ? (await session().catch(() => null))?.persona === params.slice(0, 64) : false;
   let savedInvites: string[] = [];
   try { savedInvites = JSON.parse((await storeGet(`inv:${instance}`)) ?? "[]"); } catch { /* unreadable: no saved invites */ }
+  // shortcut: only all-single/multi polls can be resolved (an outcome needs an option to be "correct";
+  // text/avail questions have none). A poll mixing those in has no resolve control at all.
+  const resolvable = schema.questions.length > 0 && schema.questions.every((q) => q.kind === "single" || q.kind === "multi");
+  const outcome: Answers = st.resolution ? JSON.parse(st.resolution.outcome_json) : {};
   const draw = () => {
     const mine = st.responses[me.pk];
     const prev: Answers = mine ? JSON.parse(mine.answers_json) : {};
@@ -279,8 +283,39 @@ async function form(instance: string, params: string, invite?: string) {
           </fieldset>`).join("")}
         <button class="primary">${mine ? "Update answer" : "Submit"}</button> <span id="msg"></span>
       </form>
+      ${st.resolution
+        ? `<p class="muted">✅ Resolved ${new Date(st.resolution.ts).toLocaleDateString()}.` +
+          (mine ? ` ${schema.questions.filter((q) => q.kind === "single" || q.kind === "multi").every((q) => isCorrect(prev, outcome, q.id) === true) ? "You called it right." : "Your answer didn't match the outcome."}` : "") +
+          `</p>`
+        : own && resolvable
+          ? `<details class="resolve"><summary>Resolve this poll</summary>
+              <form id="rf">
+                ${schema.questions.map((q) => `
+                  <fieldset><legend>${esc(q.text)} — correct answer${q.required ? " *" : ""}</legend>
+                  ${q.options.map((o, i) =>
+                    `<label><input type="${q.kind === "multi" ? "checkbox" : "radio"}" name="${esc(q.id)}" value="${i}"/> ${esc(o)}</label>`).join("")}
+                  </fieldset>`).join("")}
+                <button class="primary">Resolve</button> <span id="res-msg" class="muted"></span>
+              </form>
+            </details>`
+          : ""}
       <h2>Results (${n} ${n === 1 ? "response" : "responses"})</h2>
       ${results()}`;
+    const rf = app.querySelector<HTMLFormElement>("#rf");
+    if (rf) rf.onsubmit = async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target as HTMLFormElement), out: Answers = {};
+      for (const q of schema.questions) {
+        const v = fd.getAll(q.id).map(String);
+        if (q.kind === "multi") { if (v.length) out[q.id] = v.map(Number); }
+        else if (v.length) out[q.id] = +v[0];
+        if (q.required && !(q.id in out)) return void ($("#res-msg").textContent = `Missing: ${q.text}`);
+      }
+      if (!confirm("Resolving is final and cannot be undone. Continue?")) return;
+      $("#res-msg").textContent = "Resolving...";
+      try { await sendResolution(instance, await resolve(params, out)); await refresh(); }
+      catch (err) { $("#res-msg").textContent = `Error: ${err}`; }
+    };
     const listBtn = app.querySelector<HTMLButtonElement>("#list-btn");
     if (listBtn) listBtn.onclick = async () => {
       const m = $("#list-msg");
@@ -330,8 +365,10 @@ async function form(instance: string, params: string, invite?: string) {
     // a set: the contract accepts [0,0,0], which must still count as one vote
     all.forEach((v) => new Set(([] as number[]).concat(v as number | number[])).forEach((i) => counts[i]++));
     const max = Math.max(1, ...counts);
+    const pct = shares(st.responses, q);
+    const correctSet = st.resolution ? new Set(([] as number[]).concat((outcome[q.id] as number | number[]) ?? [])) : null;
     return `<h3>${esc(q.text)}</h3>` + q.options.map((o, i) =>
-      `<div class="bar"><span>${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${counts[i]}</b></div>`).join("");
+      `<div class="bar${correctSet?.has(i) ? " correct" : ""}"><span>${correctSet?.has(i) ? "✓ " : ""}${esc(o)}</span><i style="width:${(counts[i] / max) * 100}%"></i><b>${pct[i].toFixed(0)}% · ${counts[i]}</b></div>`).join("");
   }).join("");
 
   const refresh = async () => {
